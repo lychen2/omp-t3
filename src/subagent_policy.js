@@ -18,11 +18,10 @@ function createSubagentPolicy(env = process.env) {
     return [...new Set(values)];
   };
   const allowed = read('OMPT3_SUBAGENT_ALLOWED_MODELS', [
-    'glm-5.3-flash', 'gemini-3.8-flash', 'deepseek-v4.1-flash'
+    'gpt-6-astra', 'gpt-6.1-sol', 'gemini-3.8-flash', 'gemini-4-argon',
+    'deepseek-v4.1-flash', 'gpt-6-lunag', 'gpt-6.1-terra'
   ]);
-  const disallowed = read('OMPT3_SUBAGENT_DISALLOWED_MODELS', [
-    'gpt-*sol*', '*opus*', 'glm-5.3', 'glm-5.3:*'
-  ]);
+  const disallowed = read('OMPT3_SUBAGENT_DISALLOWED_MODELS', []);
   const active = allowed.length > 0 || disallowed.length > 0;
   const compile = pattern => {
     const source = pattern.split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*');
@@ -44,9 +43,8 @@ function createSubagentPolicy(env = process.env) {
     return null;
   };
   const checkTool = (name, params) => {
-    if (!active) return null;
     if (name === 'task') {
-      return 'Subagent model policy: native task is blocked because its resolved model cannot be checked here. Use T3 delegate_task with an explicit allowed target.model.';
+      return 'T3 delegation policy: native task is disabled. Use T3 delegate_task.';
     }
     if (/^(?:mcp__t3[-_]code__)?delegate_task$/.test(name)) return checkModel(params?.target?.model);
     return null;
@@ -55,7 +53,7 @@ function createSubagentPolicy(env = process.env) {
     '## Subagent model policy (enforced by omp-t3)',
     summary,
     'These restrictions apply to subagents only; the parent model is unchanged.',
-    'Use T3 delegate_task for subagents. Native task is blocked while this policy is active.',
+    'Choose an available model from the T3 catalog; never substitute or inherit a model silently.',
     'Before delegating, use orchestrator_capabilities to find available model IDs. Set target.model explicitly on every call, including nested delegations; never inherit the parent model.',
     'Rules match model IDs case-insensitively. Unqualified rules match the final /-separated model name; qualified rules match the full ID. Only * is a wildcard. Use the catalog ID, not a display name.',
     'Prohibited or omitted models return an error before delegation. Retry with an allowed model; do not bypass the policy through another tool or command.'
@@ -71,10 +69,17 @@ function policyRuntimeSource() {
 // the launch has no bundled T3 bridge. Content-keyed paths avoid concurrent
 // installations overwriting an extension that another session is loading.
 function subagentPolicyArgs(policy) {
-  if (!policy.active) return [];
+  // Routing remains active even when both model lists are empty.
   const source = [
     policyRuntimeSource(),
     'export default function ompT3SubagentPolicy(pi) {',
+    '  const removeNativeTask = async () => {',
+    '    const active = pi.getActiveTools();',
+    '    if (active.includes("task")) await pi.setActiveTools(active.filter(name => name !== "task"));',
+    '  };',
+    '  pi.on("session_start", removeNativeTask);',
+    '  pi.on("session_tree", removeNativeTask);',
+    '  pi.on("before_agent_start", removeNativeTask);',
     '  pi.on("tool_call", (event) => {',
     '    const reason = ompt3SubagentPolicy.checkTool(event.toolName, event.input);',
     '    if (reason) return { block: true, reason };',

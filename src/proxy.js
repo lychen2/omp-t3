@@ -9,6 +9,7 @@ const { HoldOpenTracker } = require('./notices.js');
 const { ModelCatalogManager } = require('./model_catalog.js');
 const { SubagentBridge } = require('./subagent.js');
 const { CommandBridge } = require('./commands.js');
+const { QueueCompatAdapter } = require('./queue.js');
 const { resolveOmpPath } = require('./cli.js');
 const { setupSessionSymlink } = require('./symlink.js');
 const { ContractDoctor } = require('./doctor.js');
@@ -27,7 +28,7 @@ function createProxyPipeline(options) {
     childOut,
     settlementTracker = new SettlementTracker(),
     doctor = new ContractDoctor({ shimVersion: pkg.version }),
-    modelManager = new ModelCatalogManager((err) => doctor.reportDiscoveryFailure(err)),
+    modelManager = new ModelCatalogManager({ onError: (err) => doctor.reportDiscoveryFailure(err) }),
     subagentBridge = new SubagentBridge(),
     commandBridge = new CommandBridge(),
     ompPath = 'omp'
@@ -74,6 +75,12 @@ function createProxyPipeline(options) {
     const line = subagentBridge.refreshRequest();
     if (line) childIn.write(line);
   };
+  const queueAdapter = new QueueCompatAdapter({
+    writeToOmp: line => childIn.write(line.endsWith('\n') ? line : line + '\n'),
+    writeToClient: line => clientOut.write(line),
+    replayDownstream: line => processDownstream(line),
+    settlementTracker
+  });
   function start() {
     rlClient = readline.createInterface({
       input: clientIn,
@@ -91,6 +98,7 @@ function createProxyPipeline(options) {
     rlClient.on('line', (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
+      if (queueAdapter.handleUpstreamFrame(trimmed).handled) return;
 
       // 1. Notify settlement tracker of incoming turn commands; a manual
       //    compact request also synthesizes a downstream compaction_start
@@ -114,10 +122,10 @@ function createProxyPipeline(options) {
       }
 
       // 2. Intercept get_available_models
-      const modelResult = modelManager.handleUpstreamFrame(trimmed, ompPath);
-      if (modelResult.intercepted && modelResult.response) {
-        clientOut.write(modelResult.response);
-        return; // Intercepted: Do not forward to OMP
+      const modelResult = modelManager.handleUpstreamFrame(trimmed);
+      if (modelResult.intercepted) {
+        childIn.write(modelResult.forward);
+        return;
       }
 
       // 3. Serve get_commands from OMP's live catalog (translated to the Pi
@@ -168,7 +176,17 @@ function createProxyPipeline(options) {
 
     // Downstream stream: OMP -> Translator -> Client (T3 Code)
     rlChild.on('line', (line) => {
+      if (!queueAdapter.handleDownstreamFrame(line).handled) processDownstream(line);
+    });
+  }
+
+  function processDownstream(line) {
       const trimmed = line.trim();
+      const modelResult = modelManager.handleDownstreamFrame(trimmed);
+      if (modelResult.handled) {
+        clientOut.write(modelResult.line);
+        return;
+      }
       // 0. On the child's ready frame, opt into subagent frame forwarding so
       //    the bridge can enrich T3's subagent cards with live status/text.
       if (!subagentSubscriptionSent && trimmed.includes('"type":"ready"')) {
@@ -239,7 +257,6 @@ function createProxyPipeline(options) {
 
       // 4. Byte-preserving transparent passthrough (diffs, streaming tokens, dialogs, usage)
       clientOut.write(line + '\n');
-    });
   }
 
   function stop() {
@@ -274,19 +291,18 @@ function spawnAndProxy(ompArgs, options = {}) {
   setupSessionSymlink(true);
 
   const doctor = new ContractDoctor({ shimVersion: pkg.version });
-  const modelManager = new ModelCatalogManager((err) => doctor.reportDiscoveryFailure(err));
-  // Pre-warm model catalog cache so get_available_models is instantaneous.
-  // MUST be async: a synchronous execSync here stalls every frame until the
-  // omp models --json subprocess finishes (~0.6s+ with the real binary).
-  modelManager.prewarm(ompPath);
 
   const childEnv = {
     ...process.env,
-    PI_CODING_AGENT_DIR: path.join(os.homedir(), '.omp', 'agent')
+    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.omp', 'agent')
   };
   if (options.t3ExtensionPath) {
     childEnv.T3_PI_MCP_EXTENSION_PATH = options.t3ExtensionPath;
   }
+  const modelManager = new ModelCatalogManager({
+    ompPath, ompArgs, env: childEnv,
+    onError: (err) => doctor.reportDiscoveryFailure(err)
+  });
   const child = spawn(ompPath, ompArgs, {
     stdio: ['pipe', 'pipe', 'inherit'],
     env: childEnv

@@ -1,6 +1,6 @@
 {
   "name": "omp-t3",
-  "version": "1.4.0-5",
+  "version": "1.4.0-6",
   "description": "Zero-modification stdio RPC translator shim bridging T3 Code and Oh My Pi (omp)",
   "main": "src/proxy.js",
   "bin": {
@@ -19,11 +19,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hashangit/omp-t3.git"
+    "url": "git+https://github.com/lychen2/omp-t3.git"
   },
-  "homepage": "https://github.com/hashangit/omp-t3#readme",
+  "homepage": "https://github.com/lychen2/omp-t3#readme",
   "bugs": {
-    "url": "https://github.com/hashangit/omp-t3/issues"
+    "url": "https://github.com/lychen2/omp-t3/issues"
   },
   "publishConfig": {
     "access": "public"

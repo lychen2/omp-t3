@@ -1,59 +1,95 @@
 'use strict';
 
-const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
-const { execSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 
-function modelsPersistPath() {
-  const cacheDir = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
-  return path.join(cacheDir, 'omp-t3', 'models.json');
+// `omp models` accepts only --json/--kind/-e/--extension/--no-extensions/--config.
+// Of those, only the overlays below change which models exist.
+const CATALOG_FLAGS_WITH_VALUE = new Set(['-e', '--extension', '--config']);
+const CATALOG_FLAGS_NO_VALUE = new Set(['--no-extensions']);
+
+/**
+ * Derives the model-catalog context of a launch: the binary, the extension and
+ * config overlays that add or remove models, the directory omp resolves
+ * project config and relative overlay paths against, and the environment that
+ * carries the profile, the agent dir, and provider credentials.
+ *
+ * Flags `omp models` does not take are translated to the supported equivalent:
+ * `--cwd` becomes the child's working directory and `--profile` becomes
+ * `OMP_PROFILE` (documented as the same setting). Everything else (`--model`,
+ * `--session-dir`, `--no-session`, ...) affects the session but not the
+ * catalog, so it is not forwarded.
+ *
+ * @param {{ ompPath?: string, ompArgs?: string[], env?: NodeJS.ProcessEnv, cwd?: string }} [launch]
+ * @returns {{ ompPath: string, discoveryArgs: string[], env: NodeJS.ProcessEnv, cwd: string }}
+ */
+function modelDiscoveryContext({ ompPath = 'omp', ompArgs = [], env = process.env, cwd = process.cwd() } = {}) {
+  const args = Array.isArray(ompArgs) ? ompArgs.map(String) : [];
+  const discoveryArgs = [];
+  const discoveryEnv = { ...env };
+  let discoveryCwd = cwd;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) continue;
+
+    const eq = arg.indexOf('=');
+    let flag = eq === -1 ? arg : arg.slice(0, eq);
+    let inline = eq === -1 ? null : arg.slice(eq + 1);
+
+    if (inline === null && flag.length > 2 && flag.startsWith('-e') && !flag.startsWith('--')) {
+      inline = flag.slice(2); // -e/path/to/extension.js
+      flag = '-e';
+    }
+
+    if (flag === '--cwd' || flag === '--profile') {
+      const value = inline === null ? args[i + 1] : inline;
+      if (inline === null) i += 1;
+      if (typeof value !== 'string' || value === '') continue;
+      if (flag === '--cwd') discoveryCwd = path.resolve(cwd, value);
+      else discoveryEnv.OMP_PROFILE = value;
+      continue;
+    }
+
+    if (CATALOG_FLAGS_WITH_VALUE.has(flag)) {
+      const value = inline === null ? args[i + 1] : inline;
+      if (inline === null) i += 1;
+      if (typeof value !== 'string' || value === '') continue;
+      discoveryArgs.push(flag, value);
+      continue;
+    }
+
+    if (CATALOG_FLAGS_NO_VALUE.has(flag)) discoveryArgs.push(flag);
+  }
+
+  return { ompPath, discoveryArgs, env: discoveryEnv, cwd: discoveryCwd };
 }
 
 class ModelCatalogManager {
   /**
-   * @param {((err: Error) => void) | null} [onError] Invoked when live
-   *   discovery fails and nothing (not even a persisted catalog) can serve.
+   * A manager is scoped to exactly one launch context and never serves models
+   * discovered for another: the session answer, and the standalone fallback,
+   * both describe the same binary, overlays, cwd, and environment.
+   *
+   * @param {{
+   *   onError?: ((err: Error) => void) | null,
+   *   ompPath?: string,
+   *   ompArgs?: string[],
+   *   env?: NodeJS.ProcessEnv,
+   *   cwd?: string
+   * }} [options] The launch this catalog describes. `onError` is invoked when
+   *   discovery cannot produce a catalog (there is no fabricated substitute).
    */
-  constructor(onError = null) {
+  constructor(options = {}) {
+    const {
+      onError = null,
+      ompPath = 'omp',
+      ompArgs = [],
+      env = process.env,
+      cwd = process.cwd()
+    } = options;
     this.onError = onError;
-    this.cachedModels = null;
-    this.lastFetchTime = 0;
-    this.cacheTtlMs = 60 * 1000; // 1 minute in-memory cache
-    this.servingStale = false; // true when the served list is NOT from a live discovery
-  }
-
-  /**
-   * Updates the in-memory cache and persists the list to disk so a later
-   * shim process can fall back to the last successfully discovered catalog.
-   * @param {any[]} models
-   */
-  setCachedModels(models) {
-    this.cachedModels = models;
-    this.lastFetchTime = Date.now();
-    this.servingStale = false;
-    try {
-      fs.mkdirSync(path.dirname(modelsPersistPath()), { recursive: true });
-      fs.writeFileSync(modelsPersistPath(), JSON.stringify({ savedAt: Date.now(), models }, null, 0));
-    } catch {
-      // Persistence is best-effort; in-memory cache still works
-    }
-  }
-
-  /**
-   * Loads the last successfully discovered catalog from disk, if any.
-   * @returns {{ models: any[], savedAt: number } | null}
-   */
-  readPersistedModels() {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(modelsPersistPath(), 'utf8'));
-      if (Array.isArray(parsed.models) && parsed.models.length > 0) {
-        return { models: parsed.models, savedAt: parsed.savedAt || 0 };
-      }
-    } catch {
-      // No persisted catalog yet
-    }
-    return null;
+    this.context = modelDiscoveryContext({ ompPath, ompArgs, env, cwd });
   }
 
   /**
@@ -122,117 +158,81 @@ class ModelCatalogManager {
   }
 
   /**
-   * Fetches models directly via CLI command `omp models --json`.
-   * @param {string} [ompPath] 
+   * Standalone discovery for callers without a live session (`omp-t3 --check`).
+   * Throws when the launch context has no usable catalog — it never returns a
+   * substitute list.
    * @returns {any[]}
    */
-  getModels(ompPath = 'omp') {
-    const now = Date.now();
-    if (this.cachedModels && (now - this.lastFetchTime < this.cacheTtlMs)) {
-      return this.cachedModels;
-    }
-
-    try {
-      const output = execSync(`"${ompPath}" models --json`, {
-        encoding: 'utf8',
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 8000,
-        stdio: ['pipe', 'pipe', 'ignore']
-      });
-
-      const parsed = JSON.parse(output);
-      const pruned = this.pruneModels(parsed);
-      if (pruned.length === 0) {
-        throw new Error('omp models --json returned no models');
-      }
-      this.setCachedModels(pruned);
-      return this.cachedModels;
-    } catch (err) {
-      if (this.cachedModels) {
-        this.warnStale(`in-memory cached catalog (last live discovery ${new Date(this.lastFetchTime).toISOString()})`);
-        return this.cachedModels;
-      }
-
-      const persisted = this.readPersistedModels();
-      if (persisted) {
-        this.cachedModels = persisted.models;
-        this.lastFetchTime = persisted.savedAt || 0;
-        this.warnStale(`persisted catalog from ${new Date(persisted.savedAt).toISOString()} (${modelsPersistPath()})`);
-        return this.cachedModels;
-      }
-
-      if (typeof this.onError === 'function') {
-        try {
-          this.onError(err);
-        } catch {
-          // Never let diagnostics break discovery
-        }
-      }
-      this.servingStale = true;
-      process.stderr.write(
-        `omp-t3: live model discovery failed (${err && err.message ? err.message : err}) and no previously ` +
-        'discovered catalog exists; serving a minimal builtin fallback list that may be outdated.\n'
-      );
-      // Absolute last resort: builtin minimal models
-      const defaultLadder = { off: null, minimal: null, low: 'low', medium: 'medium', high: 'high' };
-      return [
-        { id: 'glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'zai', reasoning: true, thinkingLevelMap: defaultLadder },
-        { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', reasoning: true, thinkingLevelMap: defaultLadder }
-      ];
-    }
-  }
-
-  /**
-   * One-line stderr notice that the served catalog was not freshly discovered.
-   * The doctor's contract-drift report covers the underlying failure; this
-   * tells the user the list they are looking at is stale.
-   * @param {string} source Description of the stale source
-   */
-  warnStale(source) {
-    if (this.servingStale) return; // warn once per fallback episode
-    this.servingStale = true;
-    process.stderr.write(
-      `omp-t3: live model discovery failed; serving ${source}. ` +
-      'Model list may be outdated — refresh will retry on the next request.\n'
-    );
-  }
-
-  /**
-   * Pre-warms the catalog cache WITHOUT blocking the caller (spawnAndProxy
-   * must not stall the pipeline behind a synchronous CLI invocation).
-   * @param {string} ompPath
-   */
-  prewarm(ompPath = 'omp') {
-    const { execFile } = require('node:child_process');
-    execFile(ompPath, ['models', '--json'], { maxBuffer: 10 * 1024 * 1024, timeout: 10000 }, (err, stdout) => {
-      if (err || this.cachedModels) return;
-      try {
-        const parsed = JSON.parse(stdout);
-        const pruned = this.pruneModels(parsed);
-        if (pruned.length > 0) {
-          this.setCachedModels(pruned); // also persists to disk
-        }
-      } catch {
-        // Keep whatever cache exists; discovery will retry on demand
-      }
+  getModels() {
+    const { ompPath, discoveryArgs, env, cwd } = this.context;
+    const result = spawnSync(ompPath, ['models', '--json', ...discoveryArgs], {
+      encoding: 'utf8',
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 8000,
+      killSignal: 'SIGKILL',
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe']
     });
+
+    if (result.error) {
+      throw this.fail(new Error(`omp models --json could not run: ${result.error.message}`));
+    }
+    if (result.status !== 0) {
+      // omp reports the cause on an `error:` line above its stack trace.
+      const stderr = String(result.stderr || '');
+      const lines = stderr.split('\n').map((l) => l.trim()).filter(Boolean);
+      const detail = lines.find((l) => /^error:/i.test(l)) || lines[0] || `exit ${result.status}`;
+      throw this.fail(new Error(`omp models --json failed (${detail})`));
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(result.stdout);
+    } catch (err) {
+      throw this.fail(new Error(`omp models --json did not print JSON: ${err.message}`));
+    }
+
+    const models = this.pruneModels(parsed);
+    if (models.length === 0) {
+      throw this.fail(new Error('omp models --json listed no models for this context'));
+    }
+    return models;
   }
 
   /**
-   * Synthesizes a valid T3 Code ModelInfo RPC response.
+   * Records a discovery failure for the doctor and returns the error, so the
+   * caller can throw it.
+   * @param {Error} err
+   * @returns {Error}
+   */
+  fail(err) {
+    if (typeof this.onError === 'function') {
+      try {
+        this.onError(err);
+      } catch {
+        // Never let diagnostics mask the discovery error
+      }
+    }
+    return err;
+  }
+
+  /**
+   * Synthesizes a T3 Code ModelInfo response for an already discovered list.
    * Includes both data: { models } and models for maximum compatibility.
-   * @param {string | number} reqId 
-   * @param {string} [ompPath]
+   * @param {string | number} reqId
+   * @param {any[]} models
    * @returns {string} Stringified JSON response with newline
    */
-  createModelResponse(reqId, ompPath = 'omp') {
-    const models = this.cachedModels || this.getModels(ompPath);
+  createModelResponse(reqId, models) {
+    if (!Array.isArray(models)) {
+      throw new TypeError('createModelResponse requires the models discovered for this context');
+    }
     const payload = {
-      id: String(reqId),
+      id: reqId === undefined || reqId === null ? '1' : reqId,
       type: 'response',
       command: 'get_available_models',
       success: true,
-      stale: this.servingStale || undefined, // present only when list is not freshly discovered
       data: {
         models
       },
@@ -242,35 +242,71 @@ class ModelCatalogManager {
   }
 
   /**
-   * Intercepts upstream get_available_models request from T3 Code.
-   * @param {string} line 
-   * @param {string} [ompPath]
-   * @returns {{ intercepted: boolean, response?: string }}
+   * Translates T3 Code's get_available_models request into a request for the
+   * live omp session. The session answers with the catalog of the context it
+   * actually runs in, so no launch flag has to be reconstructed here.
+   * @param {string} line
+   * @returns {{ intercepted: boolean, forward?: string }}
    */
-  handleUpstreamFrame(line, ompPath = 'omp') {
-    if (line.includes('"type":"get_available_models"') || line.includes('"type": "get_available_models"')) {
-      let reqId = null;
-      try {
-        const parsed = JSON.parse(line);
-        reqId = parsed.id;
-      } catch {
-        // Fallback regex match for id
-        const m = line.match(/"id"\s*:\s*("([^"]+)"|(\d+))/);
-        if (m) {
-          reqId = m[2] !== undefined ? m[2] : Number(m[3]);
-        }
-      }
+  handleUpstreamFrame(line) {
+    if (!line.includes('get_available_models')) return { intercepted: false };
 
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return { intercepted: false };
+    }
+    if (!parsed || parsed.type !== 'get_available_models') return { intercepted: false };
+
+    return { intercepted: true, forward: line.endsWith('\n') ? line : line + '\n' };
+  }
+
+  /**
+   * Rewrites the session's catalog answer into the ModelInfo shape T3 Code
+   * consumes. A session error passes through unchanged, and an answer that is
+   * not a catalog becomes an explicit failure — never a guessed model list.
+   * @param {string} line
+   * @returns {{ handled: boolean, line?: string }}
+   */
+  handleDownstreamFrame(line) {
+    if (!line.includes('get_available_models')) return { handled: false };
+
+    let frame;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      return { handled: false };
+    }
+    if (!frame || frame.type !== 'response' || frame.command !== 'get_available_models') {
+      return { handled: false };
+    }
+    if (frame.success === false) {
+      return { handled: true, line: line.endsWith('\n') ? line : line + '\n' };
+    }
+
+    const raw = frame.data && frame.data.models;
+    if (!Array.isArray(raw)) {
+      const err = this.fail(new Error(
+        `omp get_available_models response carries no data.models array (provider="${this.context.ompPath}")`
+      ));
       return {
-        intercepted: true,
-        response: this.createModelResponse(reqId || '1', ompPath)
+        handled: true,
+        line: JSON.stringify({
+          id: frame.id === undefined ? null : frame.id,
+          type: 'response',
+          command: 'get_available_models',
+          success: false,
+          error: `omp-t3: ${err.message}`
+        }) + '\n'
       };
     }
 
-    return { intercepted: false };
+    return { handled: true, line: this.createModelResponse(frame.id, this.pruneModels(raw)) };
   }
 }
 
 module.exports = {
-  ModelCatalogManager
+  ModelCatalogManager,
+  modelDiscoveryContext
 };

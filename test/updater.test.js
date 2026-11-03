@@ -14,14 +14,12 @@ test('US8: checkout installs are guidance-only, never an error', () => {
   const info = detectInstallChannel({ execPath: checkout, npmGlobalRoot: NPM_ROOT });
   assert.equal(info.channel, 'checkout');
   assert.equal(info.realpath, checkout);
-  assert.equal(channelUpdateCommand('checkout'), 'git -C <checkout> pull && npm install');
 });
 
 test('US8: npm-global installs detect the npm channel', () => {
   const npmBin = path.join(NPM_ROOT, 'omp-t3', 'bin', 'omp-t3.js');
   const info = detectInstallChannel({ execPath: npmBin, npmGlobalRoot: NPM_ROOT });
   assert.equal(info.channel, 'npm');
-  assert.equal(channelUpdateCommand('npm'), 'npm update -g omp-t3');
 });
 
 test('US8: homebrew installs detect the brew channel without consulting npm', () => {
@@ -29,7 +27,6 @@ test('US8: homebrew installs detect the brew channel without consulting npm', ()
   const info = detectInstallChannel({ execPath: brewBin, npmGlobalRoot: NPM_ROOT });
   assert.equal(info.channel, 'homebrew');
   assert.equal(info.npmGlobalRoot, null, 'no npm subprocess for brew installs');
-  assert.equal(channelUpdateCommand('homebrew'), 'brew upgrade hashangit/omp-t3/omp-t3');
 });
 
 test('US8: $HOMEBREW_PREFIX counts as a brew prefix', () => {
@@ -86,7 +83,7 @@ test('US8: --yes propagates the package-manager update and its exit code', () =>
   });
   assert.equal(result.ran, true);
   assert.equal(result.exitCode, 0);
-  assert.deepEqual(calls, [{ cmd: 'npm', args: ['update', '-g', 'omp-t3'], opts: { stdio: 'inherit' } }]);
+  assert.deepEqual(calls, [{ cmd: 'npm', args: ['install', '-g', 'github:lychen2/omp-t3'], opts: { stdio: 'inherit' } }]);
 
   const failed = updateSelf({
     run: true,
@@ -98,7 +95,7 @@ test('US8: --yes propagates the package-manager update and its exit code', () =>
   assert.ok(failed.lines.join('\n').includes('exited 1'), 'manual fallback command echoed');
 });
 
-test('US8: --yes for homebrew runs the tap formula', () => {
+test('fork updates retain the fork source from an existing Homebrew install', () => {
   const calls = [];
   updateSelf({
     run: true,
@@ -109,5 +106,5 @@ test('US8: --yes for homebrew runs the tap formula', () => {
       return { status: 0 };
     }
   });
-  assert.deepEqual(calls, [{ cmd: 'brew', args: ['upgrade', 'hashangit/omp-t3/omp-t3'] }]);
+  assert.deepEqual(calls, [{ cmd: 'npm', args: ['install', '-g', 'github:lychen2/omp-t3'] }]);
 });

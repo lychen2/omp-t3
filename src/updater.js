@@ -91,8 +91,8 @@ function detectInstallChannel(options = {}) {
 /** The manual command per channel, shown both for no-op and --yes runs. */
 function channelUpdateCommand(channel) {
   switch (channel) {
-    case 'npm': return 'npm update -g omp-t3';
-    case 'homebrew': return 'brew upgrade hashangit/omp-t3/omp-t3';
+    case 'npm': return 'npm install -g github:lychen2/omp-t3';
+    case 'homebrew': return 'npm install -g github:lychen2/omp-t3';
     default: return 'git -C <checkout> pull && npm install';
   }
 }

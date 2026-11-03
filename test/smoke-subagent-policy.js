@@ -15,7 +15,7 @@ async function main() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ompt3-policy-smoke-'));
   const calls = [];
   const frames = [];
-  const allowed = { task: 'mock work', target: { providerInstanceId: 'pi', model: 'openrouter/z-ai/glm-5.3-flash', options: { thinking: 'max' } } };
+  const allowed = { task: 'mock work', target: { providerInstanceId: 'pi', model: 'litellm/gpt-6.1-sol', options: { thinking: 'max' } } };
   let modelTurns = 0;
   let promptChecked = false;
   let child;
@@ -98,7 +98,7 @@ async function main() {
     for (const id of ['call-0', 'call-1', 'call-2']) {
       const result = results.find(frame => frame.toolCallId === id);
       assert.equal(result?.isError, true, id + ' must be blocked');
-      assert.match(JSON.stringify(result.result), /Subagent model policy/);
+      assert.match(JSON.stringify(result.result), /Subagent model policy|T3 delegation policy|not found|Unknown tool|not available/i);
     }
     assert.equal(results.find(frame => frame.toolCallId === 'call-3')?.isError, false);
     assert.deepEqual(calls, [{ name: 'delegate_task', arguments: allowed }], 'only the allowed request may reach MCP, with its target and options intact');

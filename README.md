@@ -2,7 +2,7 @@
 
 # omp-t3
 
-Run Oh My Pi inside T3 Code.
+Run Oh My Pi inside T3 Code. This fork uses T3-owned child threads for all delegated work.
 
 T3 Code includes a provider for upstream Pi. Pointing that provider directly at `omp` breaks three things:
 
@@ -10,42 +10,28 @@ T3 Code includes a provider for upstream Pi. Pointing that provider directly at 
 2. Tool approvals. T3 Code spawns agents with `--mode rpc`. That flag mutes interactive confirmation dialogs in `omp`, so bash and file approval prompts never appear.
 3. Model discovery. `omp` lists more than 500 models across 60 providers in a single RPC response. That payload blows past the 1 MB frame limit and kills the connection.
 
-`omp-t3` sits between T3 Code and `omp` over stdio. It translates settlement and compaction frames, renders omp's `task` subagents as live tool cards with a compact status line, synthesizes the manual-compaction events T3's UI expects, enables `--mode rpc-ui`, prunes and persists the model catalog, watches for contract drift, and forwards normal streaming traffic untouched.
+`omp-t3` translates OMP's stdio protocol for T3's Pi provider: settlement, compaction, approvals, command menus, model discovery, and queue control. T3 creates and persists delegated child threads; the shim preserves OMP's active tools except the native `task` spawner.
 
 ---
 
 ## Installation
 
-### With npm
-
-Install globally using npm:
+Install this fork directly from GitHub:
 
 ```bash
-npm install -g omp-t3
+npm install -g github:lychen2/omp-t3
 ```
 
-### With Homebrew
-
-Install from the tap:
+For a local checkout:
 
 ```bash
-brew tap hashangit/omp-t3
-brew install omp-t3
+git clone https://github.com/lychen2/omp-t3.git
+cd omp-t3
+npm install -g .
 ```
 
-You can also install directly from GitHub without tapping first:
-
-```bash
-brew install hashangit/omp-t3/omp-t3
-```
-
-### Run without installing
-
-You can test `omp-t3` directly through npx:
-
-```bash
-npx omp-t3 --check
-```
+The executable remains `omp-t3`. `update --self` reports update instructions;
+`update --self --yes` installs from this fork.
 
 ---
 
@@ -115,67 +101,60 @@ The check verifies that:
 - **Version reporting:** T3's provider probe runs `--version` and requires a semver >= 0.80.5. The shim versions itself as `<pi-major>.<pi-minor>.<pi-patch>-<iteration>` (e.g. `1.3.0-1`): the first three segments track the upstream Pi release it targets, the prerelease counter is the shim's own publish iteration. `--version` prints the Pi base on line 1 (what T3's gate parses) and the full identity on line 2 — fully offline and instant.
 - **Settlement mapping (session mirroring):** Captures `prompt_result` status, catches `session_settled`, and emits `agent_settled` with the right `aborted` boolean so T3 Code marks the turn complete. Injects `pendingMessageCount` (omp's `queuedMessageCount` **plus** `hasPendingAsyncWork`) into `get_state` responses, which T3's settle probe reads — pending background jobs and detached subagents hold the run open exactly as long as omp holds the session unsettled. The T3 run therefore *mirrors* the omp session: omp ends every model cycle (prompt turn, steered reply, background-wake reply) with `agent_end` but withholds `session_settled` while background work is pending, so the run stays open across the pause, the wake cycle delivers its results *into* the still-active run, and the translated `session_settled` finalizes it once drained. **Stop always wins:** an abort while a cycle is open synthesizes the terminal from that cycle's `agent_end`, and an abort of a paused run (no cycle open — no `agent_end` will ever come) synthesizes it immediately, so stopping never hangs. Whether the session's pending work survives a stop is T3's call, not the shim's: a graceful interrupt (no runtime restart) leaves it alive for the thread (verified on the wire against omp 18.12.0), while an interrupt that requests a runtime restart terminates the provider process tree and takes the pending work with it (verified live through T3's thread-interrupt API — the tree dies, no rogues remain, and the next message respawns the provider with full session continuity).
 - **Compaction mapping:** Renames omp's `auto_compaction_start`/`auto_compaction_end` frames (auto-compaction mid-run) to the Pi names `compaction_start`/`compaction_end`. omp's method-cascade attempts that end `skipped:true` (no result) are dropped entirely — T3 would otherwise render each as "Context compaction failed". For **manual** `/compact`, omp emits no compaction events at all (its RPC handler answers once when done), so the shim synthesizes the `compaction_start`/`compaction_end` event pair around omp's single response — giving T3 Code a live compaction card instead of silence, and keeping omp's benign "Nothing to compact (session too small)" from failing the whole turn.
-- **Model catalog pruning:** Queries `omp models --json`, drops pricing arrays and verbose schemas, and returns clean entries with both `data.models` and top-level `models`.
-- **Stale-safe model fallback:** Every successful discovery persists the catalog to `~/.cache/omp-t3/models.json`. If live discovery later fails, the shim serves the last discovered list (flagged `stale: true` on the response, with a stderr notice naming the source) instead of a hardcoded guess; a builtin minimal list is the absolute last resort on first run.
+- **Session model catalog:** Requests the catalog from the running OMP session, then removes verbose schemas and pricing before forwarding it to T3. Profiles, project settings, environment, and extension-provided models are therefore the session's actual values. `--check` uses standalone discovery with its own launch environment. Discovery failures remain errors; no shared stale or fabricated fallback list is served.
+- **Stop and queue restoration:** T3's `clear_queue` followed by `abort`, or an older client's lone `abort`, maps to OMP's atomic `abort_and_restore_queue`. The clear response returns withdrawn steering/follow-up texts before the aborted settlement. An acknowledged clear is not repeated, and stopped queued messages cannot execute on the next turn.
 - **Contract drift watchdog:** Every cleanly settled turn records the working `omp`/shim versions to `~/.local/state/omp-t3/contract-state.json`. If OMP breaks a protocol promise (e.g. stops emitting `session_settled` after announcing settlement) or discovery dies, the shim keeps the turn alive, prints a stderr banner naming the changed side with rollback guidance, and files a rate-limited issue on GitHub with sanitized diagnostics.
 - **Slug normalization:** Strips redundant provider prefixes from model IDs, preventing double-slug lookups like `openrouter/openrouter/...` during model selection.
-- **Task-tool rendering:** omp's `task` subagents are quick in-process parallel workers, so they render as what they are — ordinary tool cards in the transcript, one per `task` call, with a compact live status line (`3/6 done · running: Piranha (glm-5.3): reading src/auth · …`) synthesized from omp's `subagent_*` frames (after opting into `set_subagent_subscription {level:"events"}`) and `get_subagents` snapshots. The task frames themselves pass through byte-identical — no rename into T3's `subagent` convention and no fake agent rows (T3's Pi adapter hardcodes `childThreadId: null`, so subagent cards could never be opened anyway; see the [gap report](https://github.com/hashangit/omp-t3/blob/main/specs/002-bridge-ux-parity/subagent-open-gap-report.md)). Child events are attributed to the `task` call that spawned them (omp attributes late events to whichever tool is currently active), and child state is pruned when the task call ends. **Stop and reconciliation:** interrupting a T3 run closes every open task card with a synthetic `tool_execution_end` (`… · interrupted`) and sends omp one `cancel_subagent` hard-kill per live child — mirroring how T3's own Codex adapter propagates a parent interrupt to its children — so an interrupted run can neither leave a hanging card in T3 nor orphaned subagents in omp. Between events, the bridge reconciles against omp's authoritative `get_subagents` snapshot (on subscription activation, on each new `task` call, and while runs are held open), which heals missed spawn events and keeps names, models, and narration current. Long-running delegated work belongs in T3's `delegate_task` children (openable threads) — see [AGENTS.md §Subagents](AGENTS.md) and [Limiting concurrent subagents](#limiting-concurrent-subagents).
+- **Delegated tasks:** Use T3 `delegate_task` with an explicit catalog model. Returned T3 thread links open the actual child conversation. T3 owns results, single-task cancellation, parent Stop, and persisted restart state. Restored native OMP task events retain their tool-card translation.
 - **Command & skill menu:** Serves T3's `get_commands` polls from OMP's live catalog (cached from OMP's startup push, refreshed on demand): builtins like `/context`, `/stats`, `/usage`, and `/dump` appear in T3's `/` menu as extension commands, and OMP's skills (already named `skill:*`) land in T3's `$` skill menu with `source:"skill"`. OMP's richer source enum is projected onto Pi's `extension`/`prompt`/`skill` enum. When a command runs, OMP's `command_output` frames are re-emitted as rendered text inside the command-only turn — ANSI-stripped and wrapped in a fenced code block, because T3 renders assistant text as markdown (bare newlines collapse; a fence preserves omp's line-oriented bar-chart layout in monospace) — and the turn is settled from OMP's `data.agentInvoked:false` completion signal, which would otherwise hang, since local-only commands never emit `session_settled` and T3's own idle probe is suppressed once output rendered.
 - **T3 extension adaptation:** T3 injects its bundled MCP bridge as a pi extension (`--extension …/pi-t3-mcp-extension.ts` plus `T3_PI_MCP_EXTENSION_PATH`). That extension's `$name` skill inliner resolves skills through Pi's `command.sourceInfo.path`, while OMP's in-process commands expose the same file as `command.path`, so on stock OMP every prompt mentioning `$name` crashed the handler and the skill body was never inlined. The shim rewrites that one extension entry to a shim-managed copy under `~/.cache/omp-t3/` (identical source except `getCommands()` projects `command.path` into `sourceInfo.path`) and repoints `T3_PI_MCP_EXTENSION_PATH` at the copy, keeping the extension's tool-ownership identity checks working. If a T3 update changes the extension source so the known marker no longer matches, the original is passed through untouched with a stderr warning — `$name` inlining then degrades to the old crash instead of running stale adapted code. Other extensions and the `get_commands` menu projection are untouched.
-- **Subagent concurrency cap (opt-in):** Setting `OMPT3_MAX_SUBAGENTS=<N>` in the shim's environment atomically writes `~/.cache/omp-t3/subagent-limits-<N>.yml` (containing omp's `task: maxConcurrency: N`) and appends `--config <that file>` to every spawned omp. omp natively enforces that setting — its task-tool semaphore queues excess spawns until a slot frees — and derives the "Max N concurrent subagents" line of its own system prompt from the same key, so the lead agent is *told* the limit, not just throttled. See [Limiting concurrent subagents](#limiting-concurrent-subagents). Without the variable (or with a non-plain-integer value, warned and ignored) launches are byte-identical to before.
 - **Byte passthrough:** Everything else (token streaming deltas, diff streams, approvals, and terminal signals) passes through without JSON parsing overhead.
-
-### Limiting concurrent subagents
-
-The model policy described below blocks native `task` by default. This cap is useful only when both model lists are explicitly cleared to allow native tasks.
-
-Each omp subagent is an in-process async task sharing omp's single V8 heap. Long fan-out fleets (6+ concurrent reviewers with large transcripts) can exhaust that heap and `SIGABRT` the whole provider scope — capping live children bounds the peak. Native `task` subagents are meant for short parallel work, so the recommended cap is 5:
-
-```bash
-# In the environment the T3-launched shim inherits (e.g. a wrapper):
-OMPT3_MAX_SUBAGENTS=5 omp-t3   # exec omp-t3 "$@" for a passthrough wrapper
-```
-
-What happens: the shim atomically writes `~/.cache/omp-t3/subagent-limits-<N>.yml` (one immutable file per distinct cap, so concurrent shims never overwrite each other) and adds `--config <that file>` to the omp launch. omp queues the 6th+ concurrent `task` spawn (T3 needs no change — queued children simply appear later, and hold-open counts stay truthful) and tells the model "Max 5 concurrent subagents; excess queue." in its system prompt, so disciplined leads dispatch in waves without hitting the queue. The value must be a plain positive integer (`5`, not `0x10`/`1e3`/padded); anything else is warned about on stderr and ignored, and an unwritable cache dir degrades to launching without the cap (never a crash). The cap is per-omp-session, not machine-wide: your direct `omp` terminals keep their own setting.
-
-Long-running delegated work does not belong in native subagents at all: per [AGENTS.md §Subagents](AGENTS.md), use T3's `delegate_task` MCP tool — those children run as T3-owned threads (openable in T3's UI, outside omp's heap) instead of in-process cards.
 
 ## Delegation enforcement
 
-By default, `omp-t3` supplies a built-in tool list that excludes OMP's in-process `task` spawner. It appends a system-prompt policy directing delegated work to T3's `delegate_task` MCP tool, where children run in separate, openable threads. The shim removes the native spawner; T3 owns scheduling of delegated threads. `OMPT3_MAX_SUBAGENTS` limits OMP's native tasks only and does not cap T3 `delegate_task` children.
+`omp-t3` routes delegated work through T3's `delegate_task`. Its extension reads OMP's actual enabled tools and removes only `task`, including after session-tree restoration and before a turn. Configured plugins, MCP tools, and explicit `--tools` selections remain OMP's responsibility. Startup launches one OMP session without a tool-list probe.
 
-Set `OMPT3_DELEGATE_TASKS=0` to restore the stock tool list and skip the delegation-routing appendix. An explicit `--tools` list, in either CLI form, also takes precedence over tool-list injection and validation. Explicit lists are passed to OMP unchanged, including any validation errors. The separate subagent model policy still applies in both cases and is appended to any user prompt appendix.
-
-For shim-supplied lists, a startup probe waits up to five seconds for OMP's `ready` frame. OMP's singular or plural unknown-tool errors and unavailable-tool errors prune only the named entries, with at most five probes. A timeout, spawn failure, unrecognized error, or empty remaining list falls back to stock tooling with a stderr warning. Fallback preserves user arguments, the concurrency overlay, and the subagent model policy and its blocking hook. The model policy continues to block native `task` on this path.
-
-The probe starts OMP with the launch arguments and agent directory, so configured extensions and MCP servers may initialize during validation as well as during the final launch. Each probe uses its own process group on Unix, which is terminated before the next launch. A `ready` frame validates startup; it does not guarantee model credentials, quotas, or subsequent requests will succeed.
+The routing hook remains active when model restrictions are cleared. The lead agent is instructed to keep at most four delegated tasks active; this is a scheduling convention, not a second queue or a shim-enforced semaphore.
 
 ### Restricting subagent models
 
-`omp-t3` defaults to your AGENTS.md model choices. Only `glm-5.3-flash`, `gemini-3.8-flash`, and `deepseek-v4.1-flash` are allowed. The deny rules are `gpt-*sol*`, `*opus*`, `glm-5.3`, and `glm-5.3:*`, covering GPT Sol, Opus, and base GLM 5.3, including its batch variant. The parent model is unaffected.
+Default allowed models: `gpt-6-astra`, `gpt-6.1-sol`, `gemini-3.8-flash`, `gemini-4-argon`, `deepseek-v4.1-flash`, `gpt-6-lunag`, and `gpt-6.1-terra`. The default denylist is empty. The parent model is unaffected.
 
 Set either variable in the environment inherited by `omp-t3` to replace that list:
 
 ```bash
-export OMPT3_SUBAGENT_ALLOWED_MODELS='glm-5.3-flash,gemini-3.8-flash,deepseek-v4.1-flash'
-export OMPT3_SUBAGENT_DISALLOWED_MODELS='gpt-*sol*,*opus*,glm-5.3,glm-5.3:*'
+export OMPT3_SUBAGENT_ALLOWED_MODELS='gpt-6-astra,gpt-6.1-sol,gemini-3.8-flash,gemini-4-argon,deepseek-v4.1-flash,gpt-6-lunag,gpt-6.1-terra'
+export OMPT3_SUBAGENT_DISALLOWED_MODELS=''
 ```
 
-Values are comma-separated model IDs or patterns, with `*` as the only wildcard. Matching is case-insensitive and anchored to the whole ID. A rule containing `/` matches the full catalog ID; a rule without `/` matches the final model name. For example, `glm-5.3-flash` matches `openrouter/z-ai/glm-5.3-flash`, while `openrouter/z-ai/glm-5.3-flash` restricts the provider too. Display names such as `GLM 5.3 Flash` are invalid. Whitespace around list entries is ignored. Deny rules always win, even when a model also matches an allow rule.
-
-Exact default rules deliberately exclude aliases such as `glm-flash-latest` and variants such as `glm-5.3-flashx`, dated releases, and `:batch`. Add their exact IDs, or a deliberate wildcard, if you want them. Call `orchestrator_capabilities` to find IDs available in your T3 catalog.
+Values are comma-separated model IDs or patterns, with `*` as the only wildcard. Matching is case-insensitive and anchored to the whole ID. A rule containing `/` matches the full catalog ID; an unqualified rule matches the final model name. For example, `gpt-6.1-sol` matches `litellm/gpt-6.1-sol`. Deny rules take precedence. Call `orchestrator_capabilities` to select a full, available catalog ID; aliases and version variants require their own rules.
 
 The shim appends these rules to the system prompt on every launch path. A blocking OMP extension checks direct T3 delegation calls, and the adapted T3 MCP client checks again before sending `delegate_task`, including calls through registered tool handlers in scripts. Both T3 tool-name prefixes are covered. Every delegation must set `target.model` explicitly. Omitted, denied, or unlisted models return a tool error before a child starts. Allowed calls retain their provider, model options, and other arguments without rewriting the model.
 
-Native `task` resolves its final model internally, so the hook blocks it while either list is active and directs the agent to T3 delegation. This also applies with `OMPT3_DELEGATE_TASKS=0`, explicit `--tools=task`, or readiness fallback. Unreadable or incompatible bundled T3 extensions, or failure to write the guard files, refuse the launch instead of silently dropping enforcement. A change only to the skill-inlining marker still allows the model guard to load, with a warning about skill inlining.
+The routing hook blocks native `task` independently of model restrictions. With a model policy active, unreadable or incompatible bundled T3 extensions and guard-cache failures refuse launch rather than dropping enforcement. Skill-inlining marker drift produces a warning while preserving the model guard.
 
-An explicitly empty value clears that list. An empty allowlist permits any explicit model except those denied; an empty denylist keeps the allowlist. Set **both** variables to empty strings to turn off model restrictions. Combine that with `OMPT3_DELEGATE_TASKS=0` to restore stock native tasks and prompt behavior. Restart the provider session after changing its environment.
+An explicitly empty value clears that list. An empty allowlist permits any explicit model except those denied; an empty denylist keeps the allowlist. Clearing both disables model restrictions but keeps T3 routing. Restart the provider session after changing its environment.
 
 This policy covers tools in OMP sessions launched through this shim. It is not a T3 server-wide restriction on other providers, top-level conversations, or arbitrary shell commands.
 
+### Runtime verification and limits
+
+Verified with OMP 18.16.0: live catalog discovery, preservation of custom tools,
+model-policy enforcement at the MCP boundary, atomic queue withdrawal, and
+reopening a stopped session followed by an explicit new prompt. Live T3 delegation
+was exercised for child creation, result delivery, and running-task cancellation.
+
+T3's server-wide restart recovery and parent-Stop traversal remain T3-owned and
+were not exercised by restarting the live server. This shim does not recreate
+cancelled children or maintain a separate task database. Current T3 displays
+cleared messages in a system notice; its `clear_queue` response accepts text only,
+so image attachments are not restored by that interface. Queue withdrawal needs
+OMP's `abort_and_restore_queue`; unsupported versions return an error before the
+adapter falls back to their plain abort behavior.
+
 ## CLI
 
-`omp-t3` handles four helper flags plus the `update` subcommand locally. It rewrites `--mode` to `rpc-ui`, applies [delegation enforcement](#delegation-enforcement) by default, and optionally adds the `OMPT3_MAX_SUBAGENTS` config overlay. Other arguments pass through to OMP:
+`omp-t3` handles four helper flags and `update` locally, rewrites `--mode` to `rpc-ui`, and applies [delegation enforcement](#delegation-enforcement). Other arguments pass through to OMP:
 
 | Command | Behavior |
 |---|---|
@@ -206,7 +185,15 @@ npm test
 
 ## Changelog
 
-**Availability note:** the entries below describe the repository's current `main`. As of this writing, npm's dist-tags still serve `latest: 1.3.0-4` / `beta: 1.4.0` — the 1.4.0-x iterations are pending publish. Until they are published, install from a checkout of this repository (`npm install -g .`) or run `bin/omp-t3` directly.
+Install the fork from GitHub or a local checkout; the npm registry package belongs to the upstream project.
+
+### 1.4.0-6
+
+- T3-owned delegation with independent model restrictions and seven default model choices.
+- Live OMP tool selection, removing only `task`; single-session startup without fixed tool lists or native-task concurrency overlays.
+- Session-authoritative model discovery and explicit errors instead of cross-context cached or fabricated catalogs.
+- Atomic Stop/queue restoration, preserving T3 response IDs and queue-before-settlement ordering.
+- Fork installation and explicit self-updates retain the GitHub fork source.
 
 ### 1.4.0-5
 

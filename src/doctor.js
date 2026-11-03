@@ -6,7 +6,7 @@ const path = require('node:path');
 const { exec, execFile } = require('node:child_process');
 const { notifyFrame } = require('./notices.js');
 
-const ISSUE_REPO = 'hashangit/omp-t3';
+const ISSUE_REPO = 'lychen2/omp-t3';
 const ISSUE_RATE_LIMIT_MS = 24 * 60 * 60 * 1000;
 const SETTLE_WATCHDOG_MS = 15_000; // omp writes session_settled promptly after a settled prompt_result
 
@@ -143,8 +143,7 @@ class ContractDoctor {
   }
 
   /**
-   * Reports a model-discovery contract failure (omp models --json shape or
-   * exit changed). Called from the model catalog path.
+   * Reports a failed session catalog response or standalone model discovery.
    * @param {Error} err
    */
   reportDiscoveryFailure(err) {
@@ -153,7 +152,7 @@ class ContractDoctor {
       signature: `discovery-failed:${this.currentOmpVersion() || 'unknown'}:${reason}`,
       side: 'omp',
       title: `Model discovery failed with OMP ${this.currentOmpVersion() || '?'}`,
-      detail: `omp models --json no longer produces the catalog shape omp-t3 translates (${err && err.message ? err.message : reason}). T3's model selector will fall back to custom models only.`,
+      detail: `OMP model discovery could not produce the catalog omp-t3 translates (${err && err.message ? err.message : reason}).`,
       sample: { error: String((err && err.message) || reason).slice(0, 300) }
     });
   }

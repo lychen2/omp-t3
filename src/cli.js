@@ -1,38 +1,18 @@
 'use strict';
 
 const fs = require('node:fs');
-const crypto = require('node:crypto');
-const os = require('node:os');
-const path = require('node:path');
 const { execSync } = require('node:child_process');
 const pkg = require('../package.json');
 const { createSubagentPolicy, subagentPolicyArgs } = require('./subagent_policy.js');
 
-/**
- * Built-in tools enabled for T3-mediated sessions when delegation
- * enforcement is on (default): the host-valid subset of omp's built-in
- * registry MINUS `task` — the in-process subagent spawner. Derived per
- * launch by the bin/omp-t3 pre-flight prune loop (omp's validator names
- * exactly which entries are unknown/unavailable on the running host), so
- * host and version differences self-correct. Setup-gated plugins (python,
- * notebook, browser, computer) are never in the registry.
- */
-const DEFAULT_TOOLS = [
-  'read', 'bash', 'edit', 'write', 'grep', 'glob', 'lsp', 'ast_edit',
-  'ask', 'debug', 'eval', 'find', 'wait', 'todo', 'web_search'
-];
-
-/**
- * System-prompt appendix injected with delegation enforcement: routes
- * subagent-shaped work to T3's delegate_task MCP tool (isolated, openable
- * child threads) instead of the removed in-process path.
- */
+// T3 owns delegated tasks; OMP's live tool selection stays otherwise intact.
 const DELEGATION_POLICY = [
   '## Delegation policy (this session runs inside T3 Code)',
   '',
   'In-process subagents are disabled in this session. When the user asks for subagents, delegates, reviewers, or parallel workers — or when a task is large enough to delegate — use the T3 `delegate_task` MCP tool.',
   'Each delegation becomes an isolated, openable T3 thread with its own provider scope; results return to this thread automatically.',
   'Do your own quick, direct work (reads, searches, edits, short commands) with your regular tools instead of delegating.',
+  'Keep at most four delegated tasks active as a scheduling convention; T3 owns their lifecycle and cancellation.',
   'Do not attempt to use an in-process `task`-style subagent tool: it is intentionally unavailable here.'
 ].join('\n');
 
@@ -91,13 +71,11 @@ function parseArgs(argv) {
   // Rewrite arguments for OMP execution
   const rewritten = [];
   let modeFound = false;
-  let toolsFound = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
 
     if (arg === '--mode') {
-      const modeValue = argv[i + 1];
       modeFound = true;
       i++; // skip next arg
 
@@ -107,12 +85,11 @@ function parseArgs(argv) {
       modeFound = true;
       rewritten.push('--mode=rpc-ui');
     } else if (arg === '--tools' || arg.startsWith('--tools=')) {
-      // An explicit tools list wins: the user scoped the toolset, we keep it.
-      toolsFound = true;
+      // The routing extension removes only task from the resolved toolset.
       rewritten.push(arg);
       if (arg === '--tools' && i + 1 < argv.length) rewritten.push(argv[++i]);
     } else if (arg === '--append-system-prompt' || arg.startsWith('--append-system-prompt=')) {
-      // Preserve the original appendix for opt-out and validation fallback.
+      // Preserve user appendices and merge the bridge policies below.
       if (arg === '--append-system-prompt') {
         rewritten.push(arg);
         if (i + 1 < argv.length) rewritten.push(argv[++i]);
@@ -129,99 +106,17 @@ function parseArgs(argv) {
     rewritten.unshift('--mode', 'rpc-ui');
   }
 
-  // Delegate-enforcement (default on; OMPT3_DELEGATE_TASKS=0 opts out).
-  // T3-mediated sessions must not spawn in-process subagents: the native
-  // `task` tool is removed from the enabled set and the routing policy is
-  // appended to the system prompt, so delegated/subagent work goes through
-  // T3's delegate_task MCP tool (isolated, openable child threads). See
-  // README "Delegation enforcement".
-  // Model restrictions are independent of delegation routing, explicit tool
-  // lists, and readiness fallback. Keep them on every launch path.
   const modelPolicy = createSubagentPolicy();
   appendSystemPrompt(rewritten, modelPolicy.prompt);
+  appendSystemPrompt(rewritten, DELEGATION_POLICY);
   rewritten.push(...subagentPolicyArgs(modelPolicy));
-  const fallbackArgs = rewritten.slice();
-  const injectedTools = process.env.OMPT3_DELEGATE_TASKS !== '0' && !toolsFound;
-  if (injectedTools) {
-    rewritten.push('--tools', DEFAULT_TOOLS.join(','));
-    appendSystemPrompt(rewritten, DELEGATION_POLICY);
-  }
-
-  // Opt-in subagent concurrency cap (OMPT3_MAX_SUBAGENTS). Without the env
-  // var this adds nothing to either launch path.
-  const capArgs = subagentCapArgs(process.env.OMPT3_MAX_SUBAGENTS);
-  rewritten.push(...capArgs);
-  fallbackArgs.push(...capArgs);
 
   return {
     action: 'proxy',
-    ompArgs: rewritten,
-    delegation: { injectedTools, fallbackArgs }
+    ompArgs: rewritten
   };
 }
 
-/**
- * Cache path for the shim-managed subagent-concurrency overlay, keyed by
- * the cap value: concurrent shims with the same cap share one immutable
- * file (no last-writer-wins), different caps get different files.
- */
-function subagentOverlayPath(max) {
-  const cacheDir = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
-  return path.join(cacheDir, 'omp-t3', `subagent-limits-${max}.yml`);
-}
-
-/**
- * Builds the extra omp argv for the opt-in subagent concurrency cap.
- *
- * omp natively enforces `task.maxConcurrency` — its task-tool semaphore
- * queues excess spawns until a slot frees — and derives the
- * "Max N concurrent subagents; excess queue." line of its own system
- * prompt from the same setting (live-verified against omp 18.12.3: an
- * overlay with maxConcurrency 2 made the model quote that exact line).
- * One repeatable `--config` overlay therefore both enforces the cap and
- * tells the lead agent about it; subagents are in-process tasks sharing
- * omp's single V8 heap, so bounding live children bounds the peak that
- * OOM-killed long fan-out sessions.
- *
- * Returns [] unless `rawValue` is a plain decimal positive integer
- * (`/^\d+$/` — no `0x10`, no `1e3`, no padded whitespace) that also fits
- * in a safe integer — every default
- * launch (and every invalid value, warned about on stderr with the value
- * control-character-sanitized) injects nothing. The overlay is written
- * atomically (temp + rename, so a concurrent reader never sees a torn
- * file and a pre-existing symlink at the target is replaced, not
- * followed); if the cache dir is unwritable the shim warns and launches
- * WITHOUT the cap rather than dying — availability over enforcement.
- * `--config` is repeatable in omp, so this never collides with
- * user-passed overlays.
- * @param {string|undefined} rawValue process.env.OMPT3_MAX_SUBAGENTS
- * @returns {string[]} argv items to append ('--config', <path>)
- */
-function subagentCapArgs(rawValue) {
-  if (rawValue === undefined || rawValue === null || rawValue === '') return [];
-  if (!/^\d+$/.test(rawValue) || Number(rawValue) < 1 || !Number.isSafeInteger(Number(rawValue))) {
-    const shown = String(rawValue).replace(/[\u0000-\u001f\u007f]/g, '?');
-    console.error(`[omp-t3] Ignoring OMPT3_MAX_SUBAGENTS='${shown}': expected a plain positive integer (e.g. 5).`);
-    return [];
-  }
-  const max = Number(rawValue);
-  try {
-    const overlayPath = subagentOverlayPath(max);
-    fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
-    const tmp = `${overlayPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-    try {
-      fs.writeFileSync(tmp, `task:\n  maxConcurrency: ${max}\n`);
-      fs.renameSync(tmp, overlayPath);
-    } catch (writeErr) {
-      fs.rmSync(tmp, { force: true });
-      throw writeErr;
-    }
-    return ['--config', overlayPath];
-  } catch (err) {
-    console.error(`[omp-t3] OMPT3_MAX_SUBAGENTS=${max} ignored: cannot write the config overlay (${err.message}); launching without the cap.`);
-    return [];
-  }
-}
 
 /**
  * Resolves the path to the real omp executable.
@@ -282,8 +177,5 @@ module.exports = {
   parseArgs,
   resolveOmpPath,
   shimVersionInfo,
-  subagentOverlayPath,
-  subagentCapArgs,
-  DEFAULT_TOOLS,
   DELEGATION_POLICY
 };

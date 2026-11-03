@@ -20,26 +20,41 @@ test('E2E: Full turn lifecycle from prompt to agent_settled', async () => {
   const childLines = collectLines(childIn);
   pipeline.start();
 
-  // 1. T3 Code initializes and asks for available models
-  clientIn.write('{"type": "get_available_models", "id": "req-init"}\n');
+  // 1. T3 Code initializes and asks for available models. The shim asks the
+  //    live session, which answers for the exact launch context it runs in.
+  const modelRequest = '{"type": "get_available_models", "id": "req-init"}';
+  clientIn.write(modelRequest + '\n');
   await new Promise((r) => setImmediate(r));
 
-  // Verify get_available_models was intercepted and NOT sent to child
-  assert.equal(childLines.lines.length, 0);
+  assert.deepEqual(childLines.lines, [modelRequest]);
+  assert.equal(clientLines.lines.length, 0, 'no catalog is served before the session answers');
+
+  childOut.write(JSON.stringify({
+    id: 'req-init',
+    type: 'response',
+    command: 'get_available_models',
+    success: true,
+    data: {
+      models: [{ provider: 'zai', id: 'glm-5.3-flash', name: 'GLM 5.3 Flash', contextWindow: 1000, cost: { input: 1 } }]
+    }
+  }) + '\n');
+  await new Promise((r) => setImmediate(r));
+
   assert.equal(clientLines.lines.length, 1);
   const modelResp = JSON.parse(clientLines.lines[0]);
   assert.equal(modelResp.id, 'req-init');
   assert.equal(modelResp.command, 'get_available_models');
   assert.equal(modelResp.success, true);
-  assert.ok(modelResp.models.length > 0);
+  assert.deepEqual(modelResp.models.map((m) => m.id), ['glm-5.3-flash']);
+  assert.equal(modelResp.models[0].cost, undefined, 'catalog is pruned before it reaches T3');
 
   // 2. T3 Code sends prompt
   const promptFrame = '{"type": "prompt", "message": "Write a hello world function"}';
   clientIn.write(promptFrame + '\n');
   await new Promise((r) => setImmediate(r));
 
-  assert.equal(childLines.lines.length, 1);
-  assert.equal(childLines.lines[0], promptFrame);
+  assert.equal(childLines.lines.length, 2);
+  assert.equal(childLines.lines[1], promptFrame);
 
   // 3. Child OMP streams turn_start, text_delta, thinking_delta
   childOut.write('{"type": "turn_start", "turn": 1}\n');
@@ -447,7 +462,7 @@ test('E2E: interrupt with live subagents closes the task card, then cancels omp 
   const childFrames = childLines.getJson();
   const cancels = childFrames.filter((f) => f.type === 'cancel_subagent');
   assert.deepEqual(cancels.map((c) => c.subagentId).sort(), ['c0', 'c1', 'c2']);
-  const abortIdx = childFrames.findIndex((f) => f.type === 'abort');
+  const abortIdx = childFrames.findIndex((f) => f.type === 'abort_and_restore_queue');
   assert.ok(abortIdx !== -1);
   for (const c of cancels) {
     assert.ok(childFrames.indexOf(c) < abortIdx, 'cancels precede the forwarded abort');
@@ -623,7 +638,7 @@ test('E2E: parallel fleet + mid-run interrupt renders exactly the real children 
     'every observed live child is cancelled by id, including the withheld one'
   );
   for (const c of cancels) assert.ok(c.id.startsWith('ompt3-sub-'));
-  const abortIdx = childFrames.findIndex((f) => f.type === 'abort');
+  const abortIdx = childFrames.findIndex((f) => f.type === 'abort_and_restore_queue');
   for (const c of cancels) assert.ok(childFrames.indexOf(c) < abortIdx, 'cancels precede the forwarded abort');
 
   // The run settles exactly once and nothing stays running.
