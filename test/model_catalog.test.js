@@ -86,6 +86,30 @@ test('ModelCatalogManager prunes models safely and keeps required fields', () =>
   assert.equal(m1.pricingStatus, undefined); // pruned
 });
 
+test('live RPC effort capabilities retain xhigh and max without offering unsupported levels', () => {
+  const manager = new ModelCatalogManager();
+  const result = manager.handleDownstreamFrame(JSON.stringify({
+    id: 'effort-catalog',
+    type: 'response',
+    command: 'get_available_models',
+    success: true,
+    data: { models: [{
+      provider: 'litellm',
+      id: 'gpt-6.1-sol',
+      reasoning: true,
+      thinking: {
+        mode: 'effort',
+        efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultLevel: 'low'
+      }
+    }] }
+  }));
+  const model = JSON.parse(result.line).data.models[0];
+  assert.deepEqual(model.thinkingLevelMap, {
+    off: null, minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max'
+  });
+});
+
 test('ModelCatalogManager strips redundant provider prefix from model id', () => {
   const manager = new ModelCatalogManager();
   const rawModels = [

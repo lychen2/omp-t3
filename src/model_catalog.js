@@ -138,11 +138,11 @@ class ModelCatalogManager {
       if (item.reasoning !== undefined) {
         entry.reasoning = Boolean(item.reasoning);
       }
-      // T3 gates the per-model Thinking ladder on `reasoning: true` plus a
-      // `thinkingLevelMap` ({off..max: level|null}); xhigh/max only appear if
-      // mapped non-null. omp reports the supported levels as an array —
-      // convert it; a boolean `thinking` field is ignored by T3.
-      const levels = Array.isArray(item.thinking) ? item.thinking : null;
+      // T3 requires explicit per-model mappings to offer xhigh/max.
+      // CLI discovery returns an array; live RPC returns thinking.efforts.
+      const levels = Array.isArray(item.thinking)
+        ? item.thinking
+        : Array.isArray(item.thinking?.efforts) ? item.thinking.efforts : null;
       if (levels) {
         const map = {};
         for (const level of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
