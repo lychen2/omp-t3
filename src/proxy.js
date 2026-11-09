@@ -10,6 +10,7 @@ const { ModelCatalogManager } = require('./model_catalog.js');
 const { SubagentBridge } = require('./subagent.js');
 const { CommandBridge } = require('./commands.js');
 const { QueueCompatAdapter } = require('./queue.js');
+const { ToolPresentation } = require('./tool_presentation.js');
 const { resolveOmpPath } = require('./cli.js');
 const { setupSessionSymlink } = require('./symlink.js');
 const { ContractDoctor } = require('./doctor.js');
@@ -31,6 +32,7 @@ function createProxyPipeline(options) {
     modelManager = new ModelCatalogManager({ onError: (err) => doctor.reportDiscoveryFailure(err) }),
     subagentBridge = new SubagentBridge(),
     commandBridge = new CommandBridge(),
+    presentation = new ToolPresentation(),
     ompPath = 'omp'
   } = options;
 
@@ -217,6 +219,7 @@ function createProxyPipeline(options) {
             doctor.noteSettled();
             // The run finalized: the next hold interval starts fresh.
             holdOpen.clear();
+            presentation.clear();
           }
         }
         return;
@@ -255,7 +258,16 @@ function createProxyPipeline(options) {
         return;
       }
 
-      // 4. Byte-preserving transparent passthrough (diffs, streaming tokens, dialogs, usage)
+      // 4. Readable cards for todo/ask/ctx, and the ask RPC marker decode.
+      //    Runs after settlement/commands/subagents so their frames keep their
+      //    existing handling; only these three tools and that marker change.
+      const presentationResult = presentation.handleDownstreamFrame(trimmed);
+      if (presentationResult.handled) {
+        if (presentationResult.line) clientOut.write(presentationResult.line);
+        return;
+      }
+
+      // 5. Byte-preserving transparent passthrough (diffs, streaming tokens, dialogs, usage)
       clientOut.write(line + '\n');
   }
 
@@ -272,7 +284,8 @@ function createProxyPipeline(options) {
     settlementTracker,
     modelManager,
     subagentBridge,
-    commandBridge
+    commandBridge,
+    presentation
   };
 }
 
@@ -294,7 +307,10 @@ function spawnAndProxy(ompArgs, options = {}) {
 
   const childEnv = {
     ...process.env,
-    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.omp', 'agent')
+    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.omp', 'agent'),
+    // The ask implementation packs its clean question text behind a marker
+    // only when the consumer declares this; tool_presentation.js decodes it.
+    OMPT3_RPC_PRESENTATION: 'ask-v1'
   };
   if (options.t3ExtensionPath) {
     childEnv.T3_PI_MCP_EXTENSION_PATH = options.t3ExtensionPath;

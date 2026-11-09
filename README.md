@@ -107,8 +107,10 @@ The check verifies that:
 - **Contract drift watchdog:** Every cleanly settled turn records the working `omp`/shim versions to `~/.local/state/omp-t3/contract-state.json`. If OMP breaks a protocol promise (e.g. stops emitting `session_settled` after announcing settlement) or discovery dies, the shim keeps the turn alive, prints a stderr banner naming the changed side with rollback guidance, and files a rate-limited issue on GitHub with sanitized diagnostics.
 - **Slug normalization:** Strips redundant provider prefixes from model IDs, preventing double-slug lookups like `openrouter/openrouter/...` during model selection.
 - **Delegated tasks:** Use T3 `delegate_task` with an explicit catalog model. Returned T3 thread links open the actual child conversation. T3 owns results, single-task cancellation, parent Stop, and persisted restart state. Restored native OMP task events retain their tool-card translation.
+- **Readable `todo`/`ask`/`ctx` cards:** These three OMP tools render as condensed cards; every other tool keeps its card untouched. The card title is a display alias (`Todo · [2/4] Fix proxy tests`, `Ask · Which storage?`, `Ctx · show build-1`) carried in `toolName`, because T3 0.1.7 reads an ordinary dynamic tool's title from `toolName` and ignores `args.title`. The persisted start frame keeps the real name in `args.tool` (`{tool:"todo",summary:"…"}`), and upstream arguments, `toolCallId`, model history and execution stay unchanged. `todo` shows objective/measure/doneWhen, `closed/total` (closed = completed + abandoned, reported separately), phase-grouped items (`✓ ◉ ○ ⊘ ✕`), budget, blocker and short commit sha; malformed snapshots and error results keep their original content. `ask` summarizes the questions and formats `details.results` answers, including custom text, notes, timeout auto-selection and the chat redirect. `ctx` summarizes `op`/`id`/`all` and passes the recall text through. The ask implementation packs the clean question text behind an `omp-t3:ask:v1` marker in the extension RPC title when `OMPT3_RPC_PRESENTATION=ask-v1` (declared by the shim); the shim decodes it and falls back to a clean `Ask` card on a malformed payload without leaking the blob.
 - **Command & skill menu:** Serves T3's `get_commands` polls from OMP's live catalog (cached from OMP's startup push, refreshed on demand): builtins like `/context`, `/stats`, `/usage`, and `/dump` appear in T3's `/` menu as extension commands, and OMP's skills (already named `skill:*`) land in T3's `$` skill menu with `source:"skill"`. OMP's richer source enum is projected onto Pi's `extension`/`prompt`/`skill` enum. When a command runs, OMP's `command_output` frames are re-emitted as rendered text inside the command-only turn — ANSI-stripped and wrapped in a fenced code block, because T3 renders assistant text as markdown (bare newlines collapse; a fence preserves omp's line-oriented bar-chart layout in monospace) — and the turn is settled from OMP's `data.agentInvoked:false` completion signal, which would otherwise hang, since local-only commands never emit `session_settled` and T3's own idle probe is suppressed once output rendered.
 - **T3 extension adaptation:** T3 injects its bundled MCP bridge as a pi extension (`--extension …/pi-t3-mcp-extension.ts` plus `T3_PI_MCP_EXTENSION_PATH`). That extension's `$name` skill inliner resolves skills through Pi's `command.sourceInfo.path`, while OMP's in-process commands expose the same file as `command.path`, so on stock OMP every prompt mentioning `$name` crashed the handler and the skill body was never inlined. The shim rewrites that one extension entry to a shim-managed copy under `~/.cache/omp-t3/` (identical source except `getCommands()` projects `command.path` into `sourceInfo.path`) and repoints `T3_PI_MCP_EXTENSION_PATH` at the copy, keeping the extension's tool-ownership identity checks working. If a T3 update changes the extension source so the known marker no longer matches, the original is passed through untouched with a stderr warning — `$name` inlining then degrades to the old crash instead of running stale adapted code. Other extensions and the `get_commands` menu projection are untouched.
+- **T3 parent worktree metadata:** The adapted extension exposes a private `omp-t3:parent-cwd:v1` event-bus query to todo-more. Its existing caller-scoped MCP client resolves the current thread, verifies an actual `subagent` relationship, and reads only the immediate parent's worktree or project root. Top-level and forked threads stay independent; unavailable metadata never authorizes a dirty completion. Updated todo-more skips commits only when the verified parent and child share a git worktree, preserving ordinary commits in isolated worktrees. Restart existing provider sessions to load the updated extension.
 - **Byte passthrough:** Everything else (token streaming deltas, diff streams, approvals, and terminal signals) passes through without JSON parsing overhead.
 
 ## Delegation enforcement
@@ -144,6 +146,8 @@ Verified with OMP 18.16.0: live catalog discovery, preservation of custom tools,
 model-policy enforcement at the MCP boundary, atomic queue withdrawal, and
 reopening a stopped session followed by an explicit new prompt. Live T3 delegation
 was exercised for child creation, result delivery, and running-task cancellation.
+
+With OMP 18.17.0 and T3 Code 0.1.7, registered tools verified readable persisted cards, original option labels, custom answers, sequential questions, cancellation, finite timeout cleanup, and shared-worktree `DONE` without staging or committing parent changes. An installed RPC error-settlement smoke observed no timer-started turn for 12 seconds while normal stop continuation remained active. Authenticated pixel rendering was not verified; the independent browser required pairing.
 
 T3's server-wide restart recovery and parent-Stop traversal remain T3-owned and
 were not exercised by restarting the live server. This shim does not recreate
@@ -182,6 +186,14 @@ Run unit and integration tests:
 npm test
 ```
 
+The local `omp-ask-more` and `omp-todo-more` adaptations use revision-pinned Bun patches in `~/.omp/plugins/package.json`. Keep that manifest, `bun.lock` and `patches/` together. From `~/.omp/plugins`, OMP 18.17.0's embedded Bun 1.4.4 can reinstall them without changing resolutions:
+
+```bash
+BUN_BE_BUN=1 omp install --frozen-lockfile
+```
+
+Use a Bun release that supports lockfile version 2; standalone Bun 1.3.13 does not. A plugin revision update requires a matching patch rather than reusing a patch for the previous revision.
+
 ---
 
 ## Changelog
@@ -195,6 +207,8 @@ Install the fork from GitHub or a local checkout; the npm registry package belon
 - Session-authoritative model discovery and explicit errors instead of cross-context cached or fabricated catalogs.
 - Atomic Stop/queue restoration, preserving T3 response IDs and queue-before-settlement ordering.
 - Fork installation and explicit self-updates retain the GitHub fork source.
+- **Readable `todo`/`ask`/`ctx` cards.** Downstream tool frames gain display-only aliases and readable content, with original names retained in `args.tool`. Todo explanations, commit scopes and shared-worktree notes remain visible. The versioned ask marker decodes to title/message; malformed or oversized payloads become clean, unanswerable errors. Upstream calls, tool IDs and model history stay unchanged.
+- **Verified parent-worktree lookup.** The adapted T3 MCP extension answers todo-more's private parent-directory query from actual immediate subagent metadata, independently of model restrictions and without new credentials or registries.
 
 ### 1.4.0-5
 

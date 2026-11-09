@@ -32,6 +32,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createSubagentPolicy, policyRuntimeSource } = require('./subagent_policy.js');
+const { registerParentCwd } = require('./parent_cwd.js');
 
 const T3_EXTENSION_BASENAME = 'pi-t3-mcp-extension.ts';
 const MCP_CLIENT_MARKER = 'const client = createMcpClient(endpoint, token);';
@@ -201,6 +202,14 @@ async function adaptT3ExtensionArgs(ompArgs, options = {}) {
       }
       // A callback preserves literal $& in the embedded regex escaping code.
       adapted = adapted.replace(MCP_CLIENT_MARKER, () => MCP_CLIENT_REPLACEMENT);
+    }
+    // The event-bus query shares T3's caller-scoped MCP client and never
+    // exposes identity or paths as model-controlled tool arguments.
+    if (source.split(MCP_CLIENT_MARKER).length - 1 === 1) {
+      adapted = adapted.replace(MCP_CLIENT_MARKER, () => [
+        MCP_CLIENT_MARKER,
+        `(${registerParentCwd.toString()})(pi, client, () => ensureStarted());`
+      ].join('\n'));
     }
     const occurrences = source.split(GET_COMMANDS_MARKER).length - 1;
     if (occurrences !== 1) {
