@@ -47,6 +47,30 @@ test('US8: $HOMEBREW_PREFIX counts as a brew prefix', () => {
   }
 });
 
+test('US8: symlinked npm and Homebrew roots match the resolved package path', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'omp-t3-install-root-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const root = path.join(fixture, 'packages');
+  const alias = path.join(fixture, 'linked-packages');
+  fs.mkdirSync(path.join(root, 'omp-t3', 'bin'), { recursive: true });
+  fs.symlinkSync(root, alias, 'junction');
+  const execPath = path.join(alias, 'omp-t3', 'bin', 'omp-t3');
+  fs.writeFileSync(execPath, '');
+
+  const npm = detectInstallChannel({ execPath, npmGlobalRoot: alias });
+  assert.equal(npm.channel, 'npm');
+  assert.equal(npm.realpath, fs.realpathSync(execPath));
+  assert.equal(npm.npmGlobalRoot, alias);
+
+  const original = process.env.HOMEBREW_PREFIX;
+  process.env.HOMEBREW_PREFIX = alias;
+  t.after(() => {
+    if (original === undefined) delete process.env.HOMEBREW_PREFIX;
+    else process.env.HOMEBREW_PREFIX = original;
+  });
+  assert.equal(detectInstallChannel({ execPath, npmGlobalRoot: alias }).channel, 'homebrew');
+});
+
 test('US8: default update [--self] is a successful no-op with manual guidance', () => {
   const result = updateSelf({
     execPath: path.join(os.tmpdir(), 'checkout', 'omp-t3.js'),

@@ -54,6 +54,15 @@ function npmGlobalRoot() {
   return null;
 }
 
+// Compare resolved package paths and roots, keeping the literal path if missing.
+function realpathOrOriginal(value) {
+  try {
+    return fs.realpathSync(value);
+  } catch {
+    return value;
+  }
+}
+
 /**
  * Detects how this omp-t3 install is managed.
  * @param {{ execPath?: string, npmGlobalRoot?: string|null }} [options]
@@ -62,13 +71,7 @@ function npmGlobalRoot() {
  * @returns {{ channel: 'npm' | 'homebrew' | 'checkout', realpath: string, npmGlobalRoot: string|null }}
  */
 function detectInstallChannel(options = {}) {
-  const inspect = options.execPath || process.argv[1] || '';
-  let real = inspect;
-  try {
-    real = fs.realpathSync(inspect);
-  } catch {
-    // Broken/unresolvable path: fall back to the literal argv path.
-  }
+  const real = realpathOrOriginal(options.execPath || process.argv[1] || '');
 
   let npmRoot = options.npmGlobalRoot !== undefined ? options.npmGlobalRoot : null;
   const isUnder = (prefix) => prefix && (real === prefix || real.startsWith(prefix + path.sep));
@@ -79,11 +82,11 @@ function detectInstallChannel(options = {}) {
 
   // Homebrew first: its cellars never overlap npm's global root, and this
   // avoids a pointless `npm root -g` subprocess for brew installs.
-  const brewRoot = brewPrefixes.find(isUnder);
+  const brewRoot = brewPrefixes.find((prefix) => isUnder(realpathOrOriginal(prefix)));
   if (brewRoot) return { channel: 'homebrew', realpath: real, npmGlobalRoot: null };
 
   if (npmRoot === null) npmRoot = npmGlobalRoot();
-  if (npmRoot && isUnder(npmRoot)) return { channel: 'npm', realpath: real, npmGlobalRoot: npmRoot };
+  if (npmRoot && isUnder(realpathOrOriginal(npmRoot))) return { channel: 'npm', realpath: real, npmGlobalRoot: npmRoot };
 
   return { channel: 'checkout', realpath: real, npmGlobalRoot: npmRoot };
 }

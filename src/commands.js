@@ -13,9 +13,9 @@
  * - Source mapping: OMP's richer catalog (builtin/extension/custom/file/skill)
  *   is projected onto Pi's `extension`/`prompt`/`skill` enum. OMP skill names
  *   are already `skill:`-prefixed, matching Pi's convention, so they land in
- *   T3's `$` skill menu unchanged. T3's bundled MCP extension needs each
- *   skill's file path through a different channel (the extension's in-process
- *   `getCommands()`); see src/extension_compat.js.
+ *   T3's `$` skill menu unchanged. Catalog metadata supplied by OMP travels
+ *   with the command. T3's bundled MCP extension reads its own in-process
+ *   catalog; see src/extension_compat.js for that adapter.
  * - Local slash-command output: OMP runs builtin commands (e.g. `/context`,
  *   `/stats`) locally and emits `command_output` text frames instead of
  *   starting an agent run. T3 has no such frame, so each one is re-emitted as
@@ -186,16 +186,23 @@ class CommandBridge {
   }
 
   /**
-   * Projects OMP's catalog onto Pi's `RpcSlashCommand[]` shape.
-   * @param {Array<{ name: string, description?: string, source?: string }>|null} commands
-   * @returns {Array<{ name: string, description: string, source: string }>}
+   * Projects OMP's catalog onto Pi's `RpcSlashCommand[]` shape. Skill paths
+   * reported by OMP and slash-command argument hints travel with the entries.
+   * @param {Array<{ name: string, description?: string, source?: string, path?: string, sourceInfo?: object, input?: { hint?: string } }>|null} commands
+   * @returns {Array<{ name: string, description: string, source: string, path?: string, sourceInfo?: object, input?: { hint: string } }>}
    */
   translate(commands) {
-    return (commands || []).map((cmd) => ({
-      name: cmd.name,
-      description: cmd.description || '',
-      source: SOURCE_MAP[cmd.source] || 'extension'
-    }));
+    return (commands || []).map((cmd) => {
+      const projected = {
+        name: cmd.name,
+        description: cmd.description || '',
+        source: SOURCE_MAP[cmd.source] || 'extension'
+      };
+      if (typeof cmd.path === 'string' && cmd.path) projected.path = cmd.path;
+      if (cmd.sourceInfo && typeof cmd.sourceInfo === 'object') projected.sourceInfo = cmd.sourceInfo;
+      if (typeof cmd.input?.hint === 'string' && cmd.input.hint) projected.input = { hint: cmd.input.hint };
+      return projected;
+    });
   }
 }
 

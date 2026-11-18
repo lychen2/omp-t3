@@ -17,11 +17,18 @@ const CATALOG = [
 
 test('translate projects OMP sources onto the Pi enum and preserves skill names', () => {
   const bridge = new CommandBridge();
-  const out = bridge.translate(CATALOG);
+  const sourceInfo = { path: '/workspace/.agents/skills/commit/SKILL.md', scope: 'project' };
+  const catalog = CATALOG.map((command) => command.name === 'skill:commit'
+    ? { ...command, path: sourceInfo.path, sourceInfo, input: { hint: 'arguments' } }
+    : command);
+  const out = bridge.translate(catalog);
   assert.deepStrictEqual(out, [
     { name: 'context', description: 'Show context usage', source: 'extension' },
     { name: 'stats', description: 'Launch the local stats dashboard', source: 'extension' },
-    { name: 'skill:commit', description: 'Commit staged changes', source: 'skill' },
+    {
+      name: 'skill:commit', description: 'Commit staged changes', source: 'skill',
+      path: sourceInfo.path, sourceInfo, input: { hint: 'arguments' }
+    },
     { name: 'review', description: 'Launch interactive code review', source: 'prompt' },
     { name: 'init', description: 'Generate AGENTS.md', source: 'prompt' },
     { name: 'autoresearch', description: 'Toggle builtin autoresearch mode', source: 'extension' },
@@ -75,8 +82,9 @@ test('cold cache injects a refresh, answers on response, and suppresses the resp
   assert.match(injected.id, /^ompt3-cmds-\d+$/);
   assert.strictEqual(injected.type, 'get_available_commands');
 
+  const catalog = [{ ...CATALOG[0], input: { hint: 'details' } }, ...CATALOG.slice(1)];
   const res = bridge.handleDownstreamFrame(
-    JSON.stringify({ id: injected.id, type: 'response', success: true, data: { commands: CATALOG } })
+    JSON.stringify({ id: injected.id, type: 'response', success: true, data: { commands: catalog } })
   );
   assert.strictEqual(res.handled, true); // suppressed from T3
   assert.strictEqual(res.emit, undefined);
@@ -84,6 +92,7 @@ test('cold cache injects a refresh, answers on response, and suppresses the resp
   const parsed = JSON.parse(answer);
   assert.strictEqual(parsed.id, 42);
   assert.strictEqual(parsed.data.commands.length, CATALOG.length);
+  assert.deepStrictEqual(parsed.data.commands[0].input, { hint: 'details' });
 });
 
 test('cold cache answers empty after the refresh timeout', async () => {
