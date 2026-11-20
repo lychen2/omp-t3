@@ -61,7 +61,7 @@ test('patterns escape regex punctuation and malformed lists fail instead of disa
 
 test('tool guard checks both T3 aliases, blocks native inheritance, and leaves ordinary tools alone', () => {
   const policy = createSubagentPolicy({});
-  for (const name of ['delegate_task', 'mcp__t3-code__delegate_task', 'mcp__t3_code__delegate_task']) {
+  for (const name of ['delegate_task', 'mcp__t3-code__delegate_task', 'mcp__t3_code__delegate_task', 'mcp__t3_code_delegate_task']) {
     assert.match(policy.checkTool(name, {}), /target.model explicitly/);
     assert.match(policy.checkTool(name, { target: { model: 'glm-5.3' } }), /rejected/);
     assert.equal(policy.checkTool(name, { target: { model: 'gpt-6.1-sol' } }), null);
@@ -110,7 +110,7 @@ function bridgeFixture() {
     'function createMcpClient() { return { callTool: async (...args) => { calls.push(args); return { content: [], structuredContent: { ok: true } }; } }; }',
     'async function start() {',
     '  const endpoint = "mock", token = "mock";',
-    '  const pi = { getCommands: () => [] };',
+    '  const pi = { getCommands: () => [], on: () => {} };',
     `  ${GET_COMMANDS_MARKER}`,
     `  ${MCP_CLIENT_MARKER}`,
     '  return client;',

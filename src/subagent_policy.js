@@ -46,7 +46,7 @@ function createSubagentPolicy(env = process.env) {
     if (name === 'task') {
       return 'T3 delegation policy: native task is disabled. Use T3 delegate_task.';
     }
-    if (/^(?:mcp__t3[-_]code__)?delegate_task$/.test(name)) return checkModel(params?.target?.model);
+    if (/^(?:delegate_task|mcp__t3(?:-code__|_code_{1,2})delegate_task)$/.test(name)) return checkModel(params?.target?.model);
     return null;
   };
   const prompt = active ? [

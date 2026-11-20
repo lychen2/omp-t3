@@ -68,6 +68,9 @@ function parseArgs(argv) {
     }
   }
 
+  const acp = argv[0] === 'acp';
+  if (acp) argv = argv.slice(1);
+
   // Rewrite arguments for OMP execution
   const rewritten = [];
   let modeFound = false;
@@ -75,13 +78,13 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
 
-    if (arg === '--mode') {
+    if (!acp && arg === '--mode') {
       modeFound = true;
       i++; // skip next arg
 
       // Always force rpc-ui mode for OMP
       rewritten.push('--mode', 'rpc-ui');
-    } else if (arg.startsWith('--mode=')) {
+    } else if (!acp && arg.startsWith('--mode=')) {
       modeFound = true;
       rewritten.push('--mode=rpc-ui');
     } else if (arg === '--tools' || arg.startsWith('--tools=')) {
@@ -102,7 +105,9 @@ function parseArgs(argv) {
   }
 
   // If no --mode was specified at all, default to rpc-ui
-  if (!modeFound) {
+  if (acp) {
+    rewritten.push('--mode', 'acp');
+  } else if (!modeFound) {
     rewritten.unshift('--mode', 'rpc-ui');
   }
 
@@ -112,7 +117,7 @@ function parseArgs(argv) {
   rewritten.push(...subagentPolicyArgs(modelPolicy));
 
   return {
-    action: 'proxy',
+    action: acp ? 'acp' : 'proxy',
     ompArgs: rewritten
   };
 }

@@ -25,6 +25,14 @@ test('parseArgs defaults to --mode rpc-ui when no mode is supplied (zero-flag UX
   assert.deepEqual(result.ompArgs.slice(0, 2), ['--mode', 'rpc-ui']);
 });
 
+test('ACP launch selects the native transport and retains the delegation policy', () => {
+  const result = parseArgs(['acp', '--model', 'litellm/gpt-6.2-sol']);
+  assert.equal(result.action, 'acp');
+  assert.deepEqual(result.ompArgs.slice(0, 4), ['--model', 'litellm/gpt-6.2-sol', '--mode', 'acp']);
+  assert.match(result.ompArgs[result.ompArgs.indexOf('--append-system-prompt') + 1], /T3 Code/);
+  assert.match(result.ompArgs[result.ompArgs.indexOf('--extension') + 1], /subagent-policy-/);
+});
+
 test('parseArgs preserves custom flags and ordering', () => {
   const result = parseArgs(['--session', 'xyz', '--mode', 'rpc', '--fork', 'prev-1']);
   assert.equal(result.action, 'proxy');

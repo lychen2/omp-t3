@@ -1,18 +1,17 @@
 'use strict';
 
 /**
- * Readable downstream cards for three OMP tools whose raw payloads are
- * unreadable in T3: `todo` (a DSL document in, a rich snapshot out), `ask`
- * (question structures) and `ctx` (recall views).
+ * Readable downstream tool cards. Rich todo/ask/ctx payloads have dedicated
+ * renderers; ordinary tools get concise action/target titles while retaining
+ * their original arguments and complete results.
  *
  * Scope is deliberately narrow:
- * - Only `tool_execution_start` / `tool_execution_update` /
- *   `tool_execution_end` are rewritten, plus the `ask` extension RPC marker
- *   described below. Every other frame crosses byte-identically.
- * - Only `todo`, `ask` and `ctx` change their card title. T3 0.1.7 reads an
- *   ordinary dynamic tool's title from `toolName` alone, so the alias lives
- *   there; `args.tool` keeps the real name in the persisted start frame.
- *   Upstream arguments, model history and `toolCallId` stay untouched.
+ * - Recognized or purpose-bearing tool execution events are presented,
+ *   along with the ask extension RPC marker described below.
+ * - Canonical tool identity stays in `toolName`; `displayTitle` carries the
+ *   label and `intent` carries the model-written purpose when present.
+ *   Ordinary-tool arguments and results remain untouched. `todo`, `ask`
+ *   and `ctx` start arguments retain compact summaries.
  * - A result with `isError: true`, an unknown tool payload or a snapshot that
  *   does not match the todo-more shape is returned unmodified.
  *
@@ -29,6 +28,18 @@ const ASK_MAX_TITLE_BYTES = 1024 * 1024;
 const ASK_UNDECODABLE_MESSAGE = 'This question could not be decoded: its text was malformed. Cancel this dialog and ask the model to try again.';
 const ASK_OVERSIZED_MESSAGE = 'This question could not be decoded: its text exceeded the 1 MiB RPC frame limit. Cancel this dialog and ask the model in smaller parts.';
 const ALIAS_TOOLS = new Set(['todo', 'ask', 'ctx']);
+const TOOL_LABELS = {
+  read: '读取', write: '写入', edit: '编辑', glob: '查找文件', grep: '搜索文本',
+  ast_grep: '搜索代码', ast_edit: '改写代码', bash: '运行命令',
+  exec_command: '终端', eval: '执行代码', web_search: '搜索网页',
+  delete: '删除', ctx_search: '搜索历史', ctx_expand: '展开历史',
+  ctx_reduce: '清理上下文', ctx_memory: '项目记忆', ctx_note: '工作笔记',
+  session_query: '查询会话', peer_ask: '询问会话', peer_send: '发送消息',
+  peer_list: '会话列表', list_sessions: '终端列表', kill_session: '停止终端',
+  write_stdin: '终端输入', set_on_exit: '退出通知',
+  monitor: '监控', wait: '等待', github: 'GitHub', debug: '调试',
+  checkpoint: '上下文检查点', rewind: '恢复上下文', generate_image: '生成图片',
+};
 const ALIAS_LIMIT = 60;
 const CURRENT_LIMIT = 32;
 const TODO_STATUSES = new Set(['pending', 'in_progress', 'completed', 'abandoned', 'blocked']);
@@ -162,7 +173,7 @@ function todoNotes(payload) {
 }
 
 /** The card title for a todo result: closed/total plus the running item. */
-function todoAlias(payload) {
+function todoDisplayTitle(payload) {
   const snapshot = payload !== null && typeof payload === 'object' && payload.details !== null && typeof payload.details === 'object'
     ? payload.details.more
     : null;
@@ -304,13 +315,53 @@ function ctxArgsSummary(args) {
   return op;
 }
 
+/** Display targets only; never copy source code or write payloads into a title. */
+function ordinarySummary(tool, args) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return '';
+  if (tool === 'eval') {
+    const language = args.language === 'py' ? 'Python' : args.language === 'js' ? 'JavaScript' : args.language;
+    return [language, args.title].filter(value => typeof value === 'string' && value.trim() !== '').join(' · ');
+  }
+  if (tool === 'write' && typeof args.path === 'string' && args.path.startsWith('xd://')) {
+    let action = '';
+    if (typeof args.content === 'string') {
+      try {
+        const device = JSON.parse(args.content);
+        if (device !== null && typeof device === 'object') {
+          action = [device.op ?? device.action, device.path ?? device.query ?? device.title]
+            .filter(value => typeof value === 'string').join(' · ');
+        }
+      } catch { /* An incomplete payload still has a useful device path. */ }
+    }
+    return [args.path, action].filter(Boolean).join(' · ');
+  }
+  if (tool === 'edit' && typeof args.input === 'string') {
+    const paths = [...args.input.matchAll(/^\[([^\n]+)#[0-9a-f]{4}\]$/gim)].map(match => match[1]);
+    if (paths.length > 0) return paths.join(' · ');
+  }
+  if (tool === 'grep' || tool === 'ast_grep') {
+    return [args.pattern ?? args.pat, args.path].filter(value => typeof value === 'string').join(' · ');
+  }
+  if (Array.isArray(args.paths)) return args.paths.filter(value => typeof value === 'string').join(' · ');
+  for (const key of ['path', 'command', 'cmd', 'query', 'title', 'action', 'op', 'to']) {
+    if (typeof args[key] === 'string' && args[key].trim() !== '') return args[key];
+  }
+  if (typeof args.session_id === 'number') return `session ${args.session_id}`;
+  return typeof args.language === 'string' ? args.language : '';
+}
+
 function summaryFor(tool, args) {
   if (tool === 'todo') return todoArgsSummary(args);
   if (tool === 'ask') return askArgsSummary(args);
-  return ctxArgsSummary(args);
+  if (tool === 'ctx') return ctxArgsSummary(args);
+  return ordinarySummary(tool, args);
 }
 
-function startAlias(tool, args) {
+function startDisplayTitle(tool, args) {
+  if (!ALIAS_TOOLS.has(tool)) {
+    const summary = ordinarySummary(tool, args);
+    return truncate(summary ? `${TOOL_LABELS[tool]} · ${summary}` : TOOL_LABELS[tool], 110);
+  }
   const summary = summaryFor(tool, args);
   const fallback = tool === 'todo' ? 'update' : tool === 'ask' ? 'question' : 'read';
   const label = tool === 'todo' ? 'Todo' : tool === 'ask' ? 'Ask' : 'Ctx';
@@ -349,11 +400,11 @@ function decodeAskRequest(frame) {
 
 class ToolPresentation {
   constructor() {
-    /** toolCallId -> { tool, alias }: start/update/end correlation and the last alias. */
+    /** toolCallId -> { tool, displayTitle }: event correlation and the last display title. */
     this.calls = new Map();
   }
 
-  /** A settled run leaves no open call aliases behind. */
+  /** A settled run leaves no open call titles behind. */
   clear() {
     this.calls.clear();
   }
@@ -375,15 +426,25 @@ class ToolPresentation {
     if (typeof frame.toolCallId !== 'string' || frame.toolCallId === '') return { handled: false, line: null };
 
     const call = this.calls.get(frame.toolCallId);
-    const tool = ALIAS_TOOLS.has(frame.toolName) ? frame.toolName : call === undefined ? null : call.tool;
+    const frameIntent = typeof frame.intent === 'string' ? frame.intent.trim() : '';
+    const argumentIntent = typeof frame.args?.i === 'string' ? frame.args.i.trim() : '';
+    const intent = frameIntent || argumentIntent || call?.intent;
+    const named = typeof frame.toolName === 'string' && frame.toolName !== '';
+    const recognized = ALIAS_TOOLS.has(frame.toolName) || Object.hasOwn(TOOL_LABELS, frame.toolName);
+    if (named && !recognized && !intent) {
+      return { handled: false, line: null };
+    }
+    const tool = named ? frame.toolName : call?.tool ?? null;
     if (tool === null) return { handled: false, line: null };
 
-    const alias = this.aliasFor(tool, frame, call);
-    const out = { ...frame, toolName: alias };
+    const displayTitle = intent ? truncate(intent, 110) : this.displayTitleFor(tool, frame, call);
+    const out = { ...frame, toolName: tool, displayTitle, ...(intent ? { intent: displayTitle } : {}) };
 
     if (frame.type === 'tool_execution_start') {
-      const summary = summaryFor(tool, frame.args);
-      out.args = summary === null ? { tool } : { tool, summary };
+      if (ALIAS_TOOLS.has(tool)) {
+        const summary = summaryFor(tool, frame.args);
+        out.args = summary === null ? {} : { summary };
+      }
     } else if (frame.type === 'tool_execution_update') {
       const partial = condense(tool, frame.partialResult, frame.isError === true);
       if (partial !== null) out.partialResult = partial;
@@ -395,21 +456,22 @@ class ToolPresentation {
     if (frame.type === 'tool_execution_end') {
       this.calls.delete(frame.toolCallId);
     } else if (call === undefined) {
-      this.calls.set(frame.toolCallId, { tool, alias });
+      this.calls.set(frame.toolCallId, { tool, displayTitle, intent });
     } else {
-      call.alias = alias;
+      call.displayTitle = displayTitle;
+      call.intent = intent;
     }
 
     return { handled: true, line: JSON.stringify(out) + '\n' };
   }
 
-  /** The frame's own data wins; a frame without data reuses the call's last alias. */
-  aliasFor(tool, frame, call) {
+  /** The frame's own data wins; a frame without data reuses the call's last title. */
+  displayTitleFor(tool, frame, call) {
     if (tool === 'todo' && frame.type !== 'tool_execution_start') {
-      const alias = todoAlias(frame.type === 'tool_execution_end' ? frame.result : frame.partialResult);
-      if (alias !== null) return alias;
+      const title = todoDisplayTitle(frame.type === 'tool_execution_end' ? frame.result : frame.partialResult);
+      if (title !== null) return title;
     }
-    return call === undefined ? startAlias(tool, frame.args) : call.alias;
+    return call === undefined ? startDisplayTitle(tool, frame.args) : call.displayTitle;
   }
 }
 

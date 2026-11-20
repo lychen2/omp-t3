@@ -2,7 +2,7 @@
 'use strict';
 
 const { parseArgs, resolveOmpPath, shimVersionInfo } = require('../src/cli.js');
-const { execSync } = require('node:child_process');
+const { execSync, spawn } = require('node:child_process');
 const { spawnAndProxy } = require('../src/proxy.js');
 const { adaptT3ExtensionArgs, readDeferralLedger } = require('../src/extension_compat.js');
 const { setupSessionSymlink } = require('../src/symlink.js');
@@ -39,6 +39,7 @@ omp-t3 - Out-of-process stdio RPC translator bridging T3 Code and Oh My Pi
 
 Usage:
   omp-t3 [flags...]
+  omp-t3 acp [flags...]  Start an ACP agent for T3's local ACP provider
 
 T3 Code Setup:
   1. Open T3 Code -> Settings -> Providers -> Pi
@@ -157,6 +158,23 @@ When --mode rpc is received from T3 Code, it is automatically rewritten to --mod
       console.log('All checks passed! omp-t3 is ready for T3 Code.');
       process.exit(0);
     }
+    break;
+  }
+
+  case 'acp': {
+    const child = spawn(resolveOmpPath(), parsed.ompArgs, { stdio: 'inherit' });
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+    const forward = signal => child.kill(signal);
+    for (const signal of signals) process.on(signal, forward);
+    child.once('error', err => {
+      console.error(`[omp-t3] Failed to start ACP agent: ${err.message}`);
+      process.exitCode = 1;
+    });
+    child.once('close', (code, signal) => {
+      for (const name of signals) process.removeListener(name, forward);
+      if (signal && process.platform !== 'win32') process.kill(process.pid, signal);
+      else process.exitCode = code ?? 1;
+    });
     break;
   }
 

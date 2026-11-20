@@ -33,6 +33,7 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createSubagentPolicy, policyRuntimeSource } = require('./subagent_policy.js');
 const { registerParentCwd } = require('./parent_cwd.js');
+const { installToolIntent } = require('./tool_intent.js');
 
 const T3_EXTENSION_BASENAME = 'pi-t3-mcp-extension.ts';
 const MCP_CLIENT_MARKER = 'const client = createMcpClient(endpoint, token);';
@@ -208,6 +209,7 @@ async function adaptT3ExtensionArgs(ompArgs, options = {}) {
     if (source.split(MCP_CLIENT_MARKER).length - 1 === 1) {
       adapted = adapted.replace(MCP_CLIENT_MARKER, () => [
         MCP_CLIENT_MARKER,
+        `(${installToolIntent.toString()})(pi);`,
         `(${registerParentCwd.toString()})(pi, client, () => ensureStarted());`
       ].join('\n'));
     }

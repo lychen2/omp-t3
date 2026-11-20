@@ -1,8 +1,8 @@
 'use strict';
 
-// Downstream presentation pins: todo/ask/ctx cards keep their real tool name in
-// args, carry a readable alias in toolName on every phase, and leave every
-// other frame, upstream argument and model-history result untouched.
+// Downstream presentation pins: toolName keeps canonical identity and
+// displayTitle carries readable titles on every phase. Ordinary payloads stay
+// intact; todo/ask/ctx starts retain only their compact display summary.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -73,20 +73,21 @@ test('non-presentation frames stay untouched, including other tools with a title
   const presentation = new ToolPresentation();
   const frames = [
     JSON.stringify({ type: 'message_update', message: 'hello' }),
-    JSON.stringify({ type: 'tool_execution_start', toolCallId: 'b1', toolName: 'bash', args: { title: 'Todo · fake' } }),
-    JSON.stringify({ type: 'tool_execution_end', toolCallId: 'b1', toolName: 'bash', result: { content: [] } })
+    JSON.stringify({ type: 'tool_execution_start', toolCallId: 'b1', toolName: 'custom_tool', args: { title: 'Todo · fake' } }),
+    JSON.stringify({ type: 'tool_execution_end', toolCallId: 'b1', toolName: 'custom_tool', result: { content: [] } })
   ];
   for (const frame of frames) {
     assert.deepEqual(presentation.handleDownstreamFrame(frame), { handled: false, line: null });
   }
 });
 
-test('todo start: readable alias, real tool name kept in args, DSL summarized', () => {
+test('todo start: canonical name retained, compact summary and display title added', () => {
   const presentation = new ToolPresentation();
   const start = apply(presentation, todoStart());
   assert.equal(start.toolCallId, 'todo_1');
-  assert.equal(start.toolName, 'Todo · INIT Ship presentation layer · 2 steps');
-  assert.deepEqual(start.args, { tool: 'todo', summary: 'INIT Ship presentation layer · 2 steps' });
+  assert.equal(start.toolName, 'todo');
+  assert.equal(start.displayTitle, 'Todo · INIT Ship presentation layer · 2 steps');
+  assert.deepEqual(start.args, { summary: 'INIT Ship presentation layer · 2 steps' });
 });
 
 test('todo start: incremental documents summarize their real first command', () => {
@@ -99,7 +100,8 @@ test('todo start: incremental documents summarize their real first command', () 
       input: '*** Begin Todo\nGOAL "Ship the fix" "Regression green" "Suite passes"\nADD "Write test" "Reproduce" 5\nADD "Fix it" "Apply" 7\n*** End Todo'
     }
   }));
-  assert.equal(goals.toolName, 'Todo · GOAL Ship the fix · 2 steps');
+  assert.equal(goals.toolName, 'todo');
+  assert.equal(goals.displayTitle, 'Todo · GOAL Ship the fix · 2 steps');
 
   const done = apply(presentation, JSON.stringify({
     type: 'tool_execution_start',
@@ -107,13 +109,15 @@ test('todo start: incremental documents summarize their real first command', () 
     toolName: 'todo',
     args: { input: '*** Begin Todo\nDONE "Write test" "test: reproduce"\n*** End Todo' }
   }));
-  assert.equal(done.toolName, 'Todo · DONE Write test');
+  assert.equal(done.toolName, 'todo');
+  assert.equal(done.displayTitle, 'Todo · DONE Write test');
 });
 
 test('todo end: goal, progress, phase groups, budget/blocker/short sha, distinct completed vs abandoned', () => {
   const presentation = new ToolPresentation();
   const end = apply(presentation, todoEnd());
-  assert.equal(end.toolName, 'Todo · [2/5] Render cards');
+  assert.equal(end.toolName, 'todo');
+  assert.equal(end.displayTitle, 'Todo · [2/5] Render cards');
   const text = end.result.content[0].text;
   assert.equal(
     text,
@@ -177,27 +181,45 @@ test('todo end: commit notes and Shared worktree lines survive without replaying
   assert.ok(!text.includes('Overall:'), 'the old summary is not replayed');
 });
 
-test('alias follows toolCallId through start, update and end even when later frames carry no args', () => {
+test('displayTitle follows todo updates and call identity through every phase', () => {
   const presentation = new ToolPresentation();
   const start = apply(presentation, todoStart('c9'));
-  assert.equal(start.toolName, 'Todo · INIT Ship presentation layer · 2 steps');
+  assert.equal(start.toolName, 'todo');
+  assert.equal(start.displayTitle, 'Todo · INIT Ship presentation layer · 2 steps');
 
-  // Update without args or a snapshot: the call's alias survives.
+  const changedSnapshot = {
+    ...SNAPSHOT,
+    phases: SNAPSHOT.phases.map((phase) => ({
+      ...phase,
+      items: phase.items.map((item) => item.title === 'Render cards' ? { ...item, title: 'Polish cards' } : item)
+    }))
+  };
   const update = apply(presentation, JSON.stringify({
     type: 'tool_execution_update',
     toolCallId: 'c9',
     toolName: 'todo',
-    partialResult: { content: [{ type: 'text', text: 'working' }] }
+    partialResult: { content: [{ type: 'text', text: 'working' }], details: { more: changedSnapshot } }
   }));
-  assert.equal(update.toolName, start.toolName);
+  assert.equal(update.toolName, 'todo');
+  assert.equal(update.displayTitle, 'Todo · [2/5] Polish cards');
 
-  // End with no toolName field still resolves through the call id.
+  // An update without args or a snapshot reuses the last display title.
+  const steady = apply(presentation, JSON.stringify({
+    type: 'tool_execution_update',
+    toolCallId: 'c9',
+    partialResult: { content: [{ type: 'text', text: 'still working' }] }
+  }));
+  assert.equal(steady.toolName, 'todo');
+  assert.equal(steady.displayTitle, update.displayTitle);
+
+  // End with no toolName field still resolves canonical identity through the call id.
   const end = apply(presentation, JSON.stringify({
     type: 'tool_execution_end',
     toolCallId: 'c9',
     result: { content: [], details: { more: SNAPSHOT } }
   }));
-  assert.equal(end.toolName, 'Todo · [2/5] Render cards');
+  assert.equal(end.toolName, 'todo');
+  assert.equal(end.displayTitle, 'Todo · [2/5] Render cards');
   assert.ok(end.result.content[0].text.includes('Progress: 2/5 closed'));
 
   // The call is gone: a later frame with only that id is not ours.
@@ -219,7 +241,8 @@ test('error results keep their text and status verbatim', () => {
   const end = apply(presentation, JSON.stringify(raw));
   assert.equal(end.isError, true);
   assert.deepEqual(end.result, raw.result);
-  assert.equal(end.toolName, 'Todo · [2/5] Render cards');
+  assert.equal(end.toolName, 'todo');
+  assert.equal(end.displayTitle, 'Todo · [2/5] Render cards');
 
   // omp may also mark the result itself.
   const nested = {
@@ -271,8 +294,9 @@ test('ask: question summary on start, formatted answers with custom text, notes 
     toolName: 'ask',
     args: { questions: [{ id: 'q1', question: 'Which storage?', options: [{ label: 'SQLite' }] }, { id: 'q2', question: 'Which OS?', options: [{ label: 'Linux' }] }] }
   }));
-  assert.equal(start.toolName, 'Ask · Which storage? (+1)');
-  assert.deepEqual(start.args, { tool: 'ask', summary: 'Which storage? (+1)' });
+  assert.equal(start.toolName, 'ask');
+  assert.equal(start.displayTitle, 'Ask · Which storage? (+1)');
+  assert.deepEqual(start.args, { summary: 'Which storage? (+1)' });
 
   const end = apply(presentation, JSON.stringify({
     type: 'tool_execution_end',
@@ -291,7 +315,8 @@ test('ask: question summary on start, formatted answers with custom text, notes 
       }
     }
   }));
-  assert.equal(end.toolName, 'Ask · Which storage? (+1)', 'the call alias stays consistent');
+  assert.equal(end.toolName, 'ask');
+  assert.equal(end.displayTitle, 'Ask · Which storage? (+1)', 'the call title stays consistent');
   assert.equal(
     end.result.content[0].text,
     [
@@ -379,14 +404,16 @@ test('ctx: input is summarized, the recall text passes through unchanged', () =>
   const start = apply(presentation, JSON.stringify({
     type: 'tool_execution_start', toolCallId: 'ctx_1', toolName: 'ctx', args: { op: 'show', id: 'build-1' }
   }));
-  assert.equal(start.toolName, 'Ctx · show build-1');
-  assert.deepEqual(start.args, { tool: 'ctx', summary: 'show build-1' });
+  assert.equal(start.toolName, 'ctx');
+  assert.equal(start.displayTitle, 'Ctx · show build-1');
+  assert.deepEqual(start.args, { summary: 'show build-1' });
 
   const raw = { content: [{ type: 'text', text: '# full recall\nline two' }], details: { truncated: false } };
   const end = apply(presentation, JSON.stringify({
     type: 'tool_execution_end', toolCallId: 'ctx_1', result: raw
   }));
-  assert.equal(end.toolName, 'Ctx · show build-1');
+  assert.equal(end.toolName, 'ctx');
+  assert.equal(end.displayTitle, 'Ctx · show build-1');
   assert.deepEqual(end.result, raw);
 });
 
@@ -469,7 +496,7 @@ test('settle clears the call map', () => {
   assert.deepEqual(res, { handled: false, line: null });
 });
 
-test('pipeline: aliases reach the consumer, unrelated frames stay byte-identical', async () => {
+test('pipeline: display titles retain canonical identity and unknown frames stay byte-identical', async () => {
   const { stdin: clientIn, stdout: clientOut } = createMockStreams();
   const { stdin: childIn, stdout: childOut } = createMockStreams();
   const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
@@ -477,7 +504,7 @@ test('pipeline: aliases reach the consumer, unrelated frames stay byte-identical
   pipeline.start();
 
   const message = JSON.stringify({ type: 'message_update', message: 'streaming' });
-  const other = JSON.stringify({ type: 'tool_execution_start', toolCallId: 'x1', toolName: 'read', args: { path: 'a' } });
+  const other = JSON.stringify({ type: 'tool_execution_start', toolCallId: 'x1', toolName: 'custom_tool', args: { path: 'a' } });
   childOut.write(message + '\n');
   childOut.write(other + '\n');
   childOut.write(todoStart('p1') + '\n');
@@ -487,10 +514,49 @@ test('pipeline: aliases reach the consumer, unrelated frames stay byte-identical
   assert.equal(client.lines[0], message, 'untouched frame crosses byte-identically');
   assert.equal(client.lines[1], other, 'other tools are never renamed');
   const start = JSON.parse(client.lines[2]);
-  assert.equal(start.toolName, 'Todo · INIT Ship presentation layer · 2 steps');
-  assert.equal(start.args.tool, 'todo');
+  assert.equal(start.toolName, 'todo');
+  assert.equal(start.displayTitle, 'Todo · INIT Ship presentation layer · 2 steps');
+  assert.deepEqual(start.args, { summary: 'INIT Ship presentation layer · 2 steps' });
   const end = JSON.parse(client.lines[3]);
-  assert.equal(end.toolName, 'Todo · [2/5] Render cards');
+  assert.equal(end.toolName, 'todo');
+  assert.equal(end.displayTitle, 'Todo · [2/5] Render cards');
   assert.ok(end.result.content[0].text.includes('Progress: 2/5 closed'));
   pipeline.stop();
+});
+
+test('ordinary cards localize titles without changing canonical identity or payloads', () => {
+  const presentation = new ToolPresentation();
+  const cases = [
+    ['read', { path: 'src/main.ts:20-40' }, '读取 · src/main.ts:20-40'],
+    ['bash', { command: 'python optimize.py --steps 40', cwd: '/work' }, '运行命令 · python optimize.py --steps 40'],
+    ['write', { path: 'xd://github', content: '{"op":"file_read","path":"README.md"}' }, '写入 · xd://github · file_read · README.md'],
+    ['edit', { input: '[src/main.ts#A1B2]\nPUT 1.=1:\n+new content\n[test/main.test.ts#C3D4]\nPUT 2.=2:\n+more' }, '编辑 · src/main.ts · test/main.test.ts'],
+    ['grep', { pattern: 'phase', path: 'src' }, '搜索文本 · phase · src'],
+    ['eval', { language: 'py', title: '汇总优化指标', code: 'print("original")', timeout: 60 }, '执行代码 · Python · 汇总优化指标'],
+    ['eval', { language: 'js', code: 'console.log("private code")' }, '执行代码 · JavaScript'],
+  ];
+  for (const [index, [tool, args, displayTitle]] of cases.entries()) {
+    const id = `ordinary_${index}`;
+    const start = apply(presentation, JSON.stringify({ type: 'tool_execution_start', toolCallId: id, toolName: tool, args }));
+    assert.equal(start.toolName, tool);
+    assert.equal(start.displayTitle, displayTitle);
+    assert.deepEqual(start.args, args);
+
+    const partialResult = { content: [{ type: 'text', text: 'partial' }], details: { progress: 0.5 } };
+    const update = apply(presentation, JSON.stringify({ type: 'tool_execution_update', toolCallId: id, toolName: tool, partialResult }));
+    assert.equal(update.toolName, tool);
+    assert.equal(update.displayTitle, displayTitle);
+    assert.deepEqual(update.partialResult, partialResult);
+
+    const result = {
+      content: [{ type: 'text', text: 'original error output' }, { type: 'image', data: 'abc', mimeType: 'image/png' }],
+      details: { trace: ['kept'] },
+      isError: true
+    };
+    const end = apply(presentation, JSON.stringify({ type: 'tool_execution_end', toolCallId: id, toolName: tool, result, isError: true }));
+    assert.equal(end.toolName, tool);
+    assert.equal(end.displayTitle, displayTitle);
+    assert.deepEqual(end.result, result);
+    assert.equal(end.isError, true);
+  }
 });
