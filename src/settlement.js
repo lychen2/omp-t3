@@ -6,6 +6,7 @@
 class SettlementTracker {
   constructor() {
     this.lastPromptStatus = null;
+    this.localCommand = null;
     // Manual compact in flight: T3 sent {"type":"compact"} and omp's RPC
     // handler awaits the whole compaction and answers with a single response
     // record - it never emits auto_compaction_start/end for manual compaction.
@@ -92,7 +93,17 @@ class SettlementTracker {
     if (/"type":\s*"prompt"/.test(line)) {
       this.lastPromptStatus = null;
       this.sawCycleThisTurn = false;
+      this.localCommand = null;
+      try {
+        const prompt = JSON.parse(line);
+        if (prompt.type === 'prompt' && typeof prompt.message === 'string') {
+          this.localCommand = /^\/([^\s]+)(?:\s|$)/.exec(prompt.message)?.[1] ?? null;
+        }
+      } catch {
+        // Invalid input passes through to omp.
+      }
     } else if (/"type":\s*"abort(_and_prompt)?"/.test(line)) {
+      this.localCommand = null;
       this.lastPromptStatus = 'aborted';
       this.sawAbort = true;
       // Subagent stop translation must land while T3's turn is still
@@ -230,6 +241,24 @@ class SettlementTracker {
         return { handled: false };
       }
       return { handled: false };
+    }
+
+    // Async extension commands can receive a prompt ack before their handler
+    // has finished. Translate the handler's explicit completion signal.
+    if (line.includes('omp-t3.command-settled')) {
+      try {
+        const frame = JSON.parse(line);
+        if (frame.type === 'extension_ui_request' && frame.method === 'setStatus' && frame.statusKey === 'omp-t3.command-settled') {
+          if (this.localCommand === null || frame.statusText !== this.localCommand || this.sawCycleThisTurn || this.cycleActive) {
+            return { handled: true, suppress: true };
+          }
+          this.localCommand = null;
+          this.settledThisCycle = true;
+          return { handled: true, emit: JSON.stringify({ type: 'agent_settled', aborted: false }) + '\n' };
+        }
+      } catch {
+        // Invalid input passes through to the client.
+      }
     }
 
     // Local-only slash commands (e.g. /context, /stats) complete with the

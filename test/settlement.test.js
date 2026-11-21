@@ -239,6 +239,25 @@ test('SettlementTracker leaves agent-invoked prompt responses untouched', () => 
   assert.equal(other.handled, false);
 });
 
+test('settles an asynchronous extension command only after its matching completion', () => {
+  const tracker = new SettlementTracker();
+  const signal = statusText => JSON.stringify({
+    type: 'extension_ui_request', method: 'setStatus', statusKey: 'omp-t3.command-settled', statusText
+  });
+
+  tracker.handleUpstreamFrame('{"type":"prompt","message":"/playbook-open test.yaml"}');
+  const ack = tracker.handleDownstreamFrame('{"type":"response","command":"prompt","success":true}');
+  assert.equal(ack.handled, false);
+  assert.equal(tracker.handleDownstreamFrame(signal('playbook-show')).suppress, true);
+  const complete = tracker.handleDownstreamFrame(signal('playbook-open'));
+  assert.deepEqual(JSON.parse(complete.emit), { type: 'agent_settled', aborted: false });
+  assert.equal(tracker.handleDownstreamFrame(signal('playbook-open')).suppress, true);
+
+  tracker.handleUpstreamFrame('{"type":"prompt","message":"/playbook-open test.yaml"}');
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  assert.equal(tracker.handleDownstreamFrame(signal('playbook-open')).suppress, true);
+});
+
 // --- Faithful session mirroring (background-pending turns) ---
 
 test('mirror: agent_end with pending work does not settle; wake + session_settled does', () => {
